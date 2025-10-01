@@ -55,11 +55,12 @@ class _DrivingScreenState extends State<DrivingScreen>
   late AudioPlayer _audioPlayer;
   Timer? _emergencyTimer;
   bool _emergencySequenceStarted = false;
-  
+
   // Sistema de niveles de alerta
   Timer? _warningTimer;
   Timer? _criticalTimer;
-  int _warningLevel = 0; // 0: Normal, 1: Advertencia (amarillo), 2: Crítico (rojo)
+  int _warningLevel =
+      0; // 0: Normal, 1: Advertencia (amarillo), 2: Crítico (rojo)
   DateTime? _warningStartTime;
   bool _isInWarningLevel = false;
 
@@ -534,24 +535,24 @@ class _DrivingScreenState extends State<DrivingScreen>
     try {
       // Limpiar formato del contacto (remover caracteres especiales y agregar código de país)
       String cleanContact = contact.replaceAll(RegExp(r'[^\d]'), '');
-      
+
       // Agregar código de país si no lo tiene
       if (!cleanContact.startsWith('52')) {
         cleanContact = '52$cleanContact'; // Código de México
       }
-      
+
       print("💬 Enviando WhatsApp automático a: $cleanContact");
 
       final String encodedMessage = Uri.encodeComponent(message);
       bool success = false;
-      
+
       // Método 1: Intent directo de Android (más confiable)
       try {
         final Uri androidIntent = Uri.parse(
-          'intent://send?phone=$cleanContact&text=$encodedMessage#Intent;scheme=whatsapp;package=com.whatsapp;end'
+          'intent://send?phone=$cleanContact&text=$encodedMessage#Intent;scheme=whatsapp;package=com.whatsapp;end',
         );
         print("🔍 Probando Intent directo de Android");
-        
+
         if (await canLaunchUrl(androidIntent)) {
           await launchUrl(androidIntent, mode: LaunchMode.externalApplication);
           print("✅ WhatsApp abierto con Intent directo");
@@ -560,7 +561,7 @@ class _DrivingScreenState extends State<DrivingScreen>
       } catch (e) {
         print("❌ Intent directo falló: $e");
       }
-      
+
       // Método 2: Esquemas tradicionales si el Intent falla
       if (!success) {
         List<String> whatsappUrls = [
@@ -568,12 +569,12 @@ class _DrivingScreenState extends State<DrivingScreen>
           'https://wa.me/$cleanContact?text=$encodedMessage',
           'https://api.whatsapp.com/send?phone=$cleanContact&text=$encodedMessage',
         ];
-        
+
         for (String urlString in whatsappUrls) {
           try {
             final Uri uri = Uri.parse(urlString);
             print("🔍 Probando: $urlString");
-            
+
             if (await canLaunchUrl(uri)) {
               await launchUrl(uri, mode: LaunchMode.externalApplication);
               print("✅ WhatsApp abierto con: $urlString");
@@ -586,7 +587,7 @@ class _DrivingScreenState extends State<DrivingScreen>
           }
         }
       }
-      
+
       if (success) {
         // Mostrar confirmación
         ScaffoldMessenger.of(context).showSnackBar(
@@ -637,22 +638,25 @@ class _DrivingScreenState extends State<DrivingScreen>
   // Iniciar countdown de emergencia (15-20 segundos)
   void _startEmergencyCountdown() {
     if (_emergencySequenceStarted) return; // Ya está iniciado
-    
+
     _emergencySequenceStarted = true;
     print("⏰ Iniciando countdown de emergencia: 18 segundos");
-    
+
     // Timer de 18 segundos antes de ejecutar llamada automática
     _emergencyTimer = Timer(const Duration(seconds: 18), () {
       if (_emergencySequenceStarted && currentDrowsinessLevel >= 0.75) {
-        print("🚨 Ejecutando secuencia de emergencia automática tras 18s de alerta");
+        print(
+          "🚨 Ejecutando secuencia de emergencia automática tras 18s de alerta",
+        );
         // Ejecutar WhatsApp y mostrar alerta automática
         if (_emergencyContacts.isNotEmpty) {
           _getRealLocation().then((_) {
-            String messageBody = "🚨 ALERTA DE EMERGENCIA 🚨\n\nSe detectó cansancio extremo sostenido por 18 segundos.\n\nUbicación: $_currentLocation\n\nHora: ${DateTime.now().toString()}\n\n¡Contacta inmediatamente!";
+            String messageBody =
+                "🚨 ALERTA DE EMERGENCIA 🚨\n\nSe detectó cansancio extremo sostenido por 18 segundos.\n\nUbicación: $_currentLocation\n\nHora: ${DateTime.now().toString()}\n\n¡Contacta inmediatamente!";
             _sendWhatsAppAlert(_emergencyContacts.first, messageBody);
           });
         }
-        
+
         // Llamada después de 2 segundos adicionales (total 20s)
         Timer(const Duration(seconds: 2), () {
           if (_emergencySequenceStarted && _emergencyContacts.isNotEmpty) {
@@ -670,7 +674,7 @@ class _DrivingScreenState extends State<DrivingScreen>
       _resetAllTimers();
       return;
     }
-    
+
     // Nivel de advertencia amarillo/naranja (40% - 79%)
     if (drowsinessLevel >= 0.40 && drowsinessLevel < 0.80) {
       if (!_isInWarningLevel) {
@@ -678,7 +682,7 @@ class _DrivingScreenState extends State<DrivingScreen>
       }
       return;
     }
-    
+
     // Nivel crítico rojo (80% - 100%) → 5 segundos para activar WhatsApp + Llamada
     if (drowsinessLevel >= 0.80) {
       if (_warningLevel < 2) {
@@ -692,13 +696,13 @@ class _DrivingScreenState extends State<DrivingScreen>
     _isInWarningLevel = true;
     _warningLevel = 1;
     _warningStartTime = DateTime.now();
-    
+
     // Vibración suave
     HapticFeedback.lightImpact();
-    
+
     // Sonido de advertencia suave
     SystemSound.play(SystemSoundType.click);
-    
+
     // Timer de 4 segundos para pasar a crítico si persiste
     _warningTimer = Timer(const Duration(seconds: 4), () {
       if (_isInWarningLevel && currentDrowsinessLevel >= 0.5) {
@@ -711,19 +715,19 @@ class _DrivingScreenState extends State<DrivingScreen>
     print("🚨 Iniciando nivel CRÍTICO (rojo)");
     _warningLevel = 2;
     _warningTimer?.cancel();
-    
+
     // Vibración fuerte
     HapticFeedback.heavyImpact();
-    
+
     // Sonido más intenso
     SystemSound.play(SystemSoundType.alert);
-    
+
     // Timer de 5 segundos en nivel rojo antes del WhatsApp
     _criticalTimer = Timer(const Duration(seconds: 5), () {
       if (_warningLevel >= 2 && currentDrowsinessLevel >= 0.75) {
         print("📱 5 segundos en nivel rojo - enviando WhatsApp");
         _sendEmergencyWhatsApp();
-        
+
         // Timer adicional de 10 segundos más para la llamada (total 15s)
         Timer(const Duration(seconds: 10), () {
           if (_warningLevel >= 2 && currentDrowsinessLevel >= 0.75) {
@@ -739,13 +743,13 @@ class _DrivingScreenState extends State<DrivingScreen>
     if (_warningLevel > 0) {
       print("✅ Reseteando todos los niveles de alerta");
     }
-    
+
     _isInWarningLevel = false;
     _warningLevel = 0;
     _warningStartTime = null;
     _warningTimer?.cancel();
     _criticalTimer?.cancel();
-    
+
     // También cancelar emergency si está activo
     _cancelEmergencyCountdown();
   }
@@ -784,18 +788,19 @@ class _DrivingScreenState extends State<DrivingScreen>
       print("❌ No hay contactos de emergencia configurados");
       return;
     }
-    
+
     print("📱 Enviando WhatsApp después de 5 segundos en nivel crítico");
-    
+
     // Obtener ubicación y enviar WhatsApp
     await _getRealLocation();
-    String messageBody = "🚨 ALERTA CRÍTICA DE SOMNOLENCIA 🚨\n\n"
+    String messageBody =
+        "🚨 ALERTA CRÍTICA DE SOMNOLENCIA 🚨\n\n"
         "⏰ Nivel crítico sostenido por 5 segundos\n"
         "📍 Ubicación: $_currentLocation\n"
         "⏱️ Hora: ${DateTime.now().toString().split('.')[0]}\n\n"
         "🚗 El conductor necesita detenerse INMEDIATAMENTE\n"
         "📞 Si no respondes, se realizará llamada automática en 10 segundos";
-        
+
     _sendWhatsAppAlert(_emergencyContacts.first, messageBody);
   }
 
@@ -805,8 +810,10 @@ class _DrivingScreenState extends State<DrivingScreen>
       print("❌ No hay contactos de emergencia configurados");
       return;
     }
-    
-    print("📞 Realizando llamada después de 15 segundos total en nivel crítico");
+
+    print(
+      "📞 Realizando llamada después de 15 segundos total en nivel crítico",
+    );
     _makeAutomaticEmergencyCall(_emergencyContacts.first);
   }
 
@@ -816,7 +823,7 @@ class _DrivingScreenState extends State<DrivingScreen>
       print("✅ Cancelando countdown de emergencia - conductor mejoró");
       _emergencyTimer?.cancel();
       _emergencySequenceStarted = false;
-      
+
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('✅ Alerta de emergencia cancelada - Estado mejorado'),
@@ -1417,25 +1424,33 @@ class _DrivingScreenState extends State<DrivingScreen>
     // Simular progresión gradual según los nuevos rangos
     Future.delayed(const Duration(seconds: 8), () {
       if (mounted && isServiceRunning) {
-        print("🟡 Simulando nivel ADVERTENCIA amarillo/naranja (45% - debería mostrar amarillo)");
+        print(
+          "🟡 Simulando nivel ADVERTENCIA amarillo/naranja (45% - debería mostrar amarillo)",
+        );
         setState(() => currentDrowsinessLevel = 0.45);
 
         // Después de 6 segundos, subir más en el rango amarillo
         Future.delayed(const Duration(seconds: 6), () {
           if (mounted) {
-            print("🟠 Simulando nivel ADVERTENCIA alto (70% - sigue amarillo/naranja)");
+            print(
+              "🟠 Simulando nivel ADVERTENCIA alto (70% - sigue amarillo/naranja)",
+            );
             setState(() => currentDrowsinessLevel = 0.70);
 
             // Después de 4 segundos más, subir a rojo crítico (80%)
             Future.delayed(const Duration(seconds: 4), () {
               if (mounted) {
-                print("🔴 Simulando nivel CRÍTICO rojo (85%) - Activará WhatsApp en 5s");
+                print(
+                  "🔴 Simulando nivel CRÍTICO rojo (85%) - Activará WhatsApp en 5s",
+                );
                 setState(() => currentDrowsinessLevel = 0.85);
 
                 // Después de 15 segundos, volver a normal para probar reset
                 Future.delayed(const Duration(seconds: 15), () {
                   if (mounted) {
-                    print("✅ Volviendo a nivel normal (20%) - Debe resetear colores");
+                    print(
+                      "✅ Volviendo a nivel normal (20%) - Debe resetear colores",
+                    );
                     setState(() => currentDrowsinessLevel = 0.20);
                   }
                 });
@@ -1469,13 +1484,28 @@ class _DrivingScreenState extends State<DrivingScreen>
     Color backgroundColor;
     switch (_warningLevel) {
       case 0:
-        backgroundColor = const Color.fromARGB(255, 8, 8, 20); // Azul muy oscuro / casi negro (normal 0-39%)
+        backgroundColor = const Color.fromARGB(
+          255,
+          8,
+          8,
+          20,
+        ); // Azul muy oscuro / casi negro (normal 0-39%)
         break;
       case 1:
-        backgroundColor = const Color.fromARGB(255, 60, 35, 0); // Naranja más visible (advertencia 40-79%)
+        backgroundColor = const Color.fromARGB(
+          255,
+          60,
+          35,
+          0,
+        ); // Naranja más visible (advertencia 40-79%)
         break;
       case 2:
-        backgroundColor = const Color.fromARGB(255, 80, 0, 0); // Rojo muy oscuro (crítico 80-100%)
+        backgroundColor = const Color.fromARGB(
+          255,
+          80,
+          0,
+          0,
+        ); // Rojo muy oscuro (crítico 80-100%)
         break;
       default:
         backgroundColor = const Color.fromARGB(255, 8, 8, 20);
@@ -1578,7 +1608,11 @@ class _DrivingScreenState extends State<DrivingScreen>
                               _bluetoothService.isConnected
                                   ? Icons.visibility_rounded
                                   : Icons.bluetooth_disabled_rounded,
-                              color: Colors.white,
+                              color: _warningLevel >= 2
+                                  ? Colors.white
+                                  : (_warningLevel >= 1
+                                        ? Colors.black87
+                                        : Colors.white),
                               size: 50,
                             ),
                           ),
@@ -1900,7 +1934,8 @@ class _DrivingScreenState extends State<DrivingScreen>
       backgroundColor: Colors.transparent,
       isDismissible: true,
       builder: (context) => StatefulBuilder(
-        builder: (context, setModalState) => _buildBluetoothModalContent(setModalState),
+        builder: (context, setModalState) =>
+            _buildBluetoothModalContent(setModalState),
       ),
     ).whenComplete(() {
       // Detener escaneo cuando se cierre el modal
@@ -1937,7 +1972,9 @@ class _DrivingScreenState extends State<DrivingScreen>
         for (var result in results) {
           if (result.device.platformName == TARGET_DEVICE_NAME &&
               connectedDevice == null) {
-            print("📱 Dispositivo objetivo encontrado, conectando automáticamente...");
+            print(
+              "📱 Dispositivo objetivo encontrado, conectando automáticamente...",
+            );
             _connectToDevice(result.device);
             break;
           }
@@ -1995,13 +2032,16 @@ class _DrivingScreenState extends State<DrivingScreen>
       print("==========================");
 
       // Buscar servicio y característica compatibles
-      Map<String, dynamic>? compatibleService = await _findCompatibleService(services);
+      Map<String, dynamic>? compatibleService = await _findCompatibleService(
+        services,
+      );
 
       if (compatibleService == null) {
         throw Exception("❌ No se encontró ningún servicio BLE compatible.");
       }
 
-      BluetoothCharacteristic dataCharacteristic = compatibleService['characteristic'];
+      BluetoothCharacteristic dataCharacteristic =
+          compatibleService['characteristic'];
 
       // Informar qué UUIDs se están usando
       String serviceUuid = compatibleService['serviceUuid'];
@@ -2037,7 +2077,7 @@ class _DrivingScreenState extends State<DrivingScreen>
 
       // Conexión exitosa
       String statusMessage = "✓ CONECTADO: ${device.platformName}";
-      
+
       // Actualizar el servicio global
       _bluetoothService.updateConnection(
         device: device,
@@ -2061,13 +2101,12 @@ class _DrivingScreenState extends State<DrivingScreen>
           backgroundColor: Colors.green,
         ),
       );
-
     } catch (e) {
       device.disconnect();
       _bluetoothService.disconnect();
       _updateStatus("❌ Fallo de conexión. $e", Colors.red);
       setState(() => connectedDevice = null);
-      
+
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('❌ Error: ${e.toString()}'),
@@ -2107,7 +2146,9 @@ class _DrivingScreenState extends State<DrivingScreen>
     return expanded1.toUpperCase() == expanded2.toUpperCase();
   }
 
-  Future<Map<String, dynamic>?> _findCompatibleService(List<BluetoothService> services) async {
+  Future<Map<String, dynamic>?> _findCompatibleService(
+    List<BluetoothService> services,
+  ) async {
     // Buscar servicio principal
     for (BluetoothService service in services) {
       if (_compareUuids(service.uuid.str, DATA_SERVICE_UUID)) {
@@ -2152,7 +2193,8 @@ class _DrivingScreenState extends State<DrivingScreen>
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
       builder: (context) => StatefulBuilder(
-        builder: (context, setModalState) => _buildEmergencyContactsModalContent(setModalState),
+        builder: (context, setModalState) =>
+            _buildEmergencyContactsModalContent(setModalState),
       ),
     );
   }
@@ -2225,7 +2267,7 @@ class _DrivingScreenState extends State<DrivingScreen>
                   ),
                 ),
                 const SizedBox(height: 15),
-                
+
                 // Campo nombre
                 TextField(
                   controller: nameController,
@@ -2244,9 +2286,9 @@ class _DrivingScreenState extends State<DrivingScreen>
                     ),
                   ),
                 ),
-                
+
                 const SizedBox(height: 15),
-                
+
                 // Campo teléfono
                 TextField(
                   controller: phoneController,
@@ -2266,15 +2308,15 @@ class _DrivingScreenState extends State<DrivingScreen>
                     ),
                   ),
                 ),
-                
+
                 const SizedBox(height: 15),
-                
+
                 // Botón agregar
                 SizedBox(
                   width: double.infinity,
                   child: ElevatedButton.icon(
                     onPressed: () async {
-                      if (nameController.text.trim().isNotEmpty && 
+                      if (nameController.text.trim().isNotEmpty &&
                           phoneController.text.trim().isNotEmpty) {
                         await _addEmergencyContact(
                           nameController.text.trim(),
@@ -2340,13 +2382,15 @@ class _DrivingScreenState extends State<DrivingScreen>
                     itemCount: _emergencyContacts.length,
                     itemBuilder: (context, index) {
                       final contact = _emergencyContacts[index];
-                      
+
                       return Container(
                         margin: const EdgeInsets.only(bottom: 10),
                         decoration: BoxDecoration(
                           color: Colors.white.withOpacity(0.05),
                           borderRadius: BorderRadius.circular(15),
-                          border: Border.all(color: Colors.white.withOpacity(0.1)),
+                          border: Border.all(
+                            color: Colors.white.withOpacity(0.1),
+                          ),
                         ),
                         child: ListTile(
                           leading: Container(
@@ -2381,7 +2425,10 @@ class _DrivingScreenState extends State<DrivingScreen>
                               setModalState(() {});
                               setState(() {});
                             },
-                            icon: const Icon(Icons.delete_rounded, color: Colors.red),
+                            icon: const Icon(
+                              Icons.delete_rounded,
+                              color: Colors.red,
+                            ),
                           ),
                         ),
                       );
@@ -2417,13 +2464,13 @@ class _DrivingScreenState extends State<DrivingScreen>
     try {
       final prefs = await SharedPreferences.getInstance();
       final contacts = prefs.getStringList('emergency_contacts') ?? [];
-      
+
       // Agregar nuevo contacto en formato "Nombre|Teléfono"
       contacts.add('$name|$phone');
-      
+
       await prefs.setStringList('emergency_contacts', contacts);
       await _loadEmergencyContacts(); // Recargar la lista
-      
+
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('✅ Contacto $name agregado'),
@@ -2439,12 +2486,12 @@ class _DrivingScreenState extends State<DrivingScreen>
     try {
       final prefs = await SharedPreferences.getInstance();
       final contacts = prefs.getStringList('emergency_contacts') ?? [];
-      
+
       if (index < contacts.length) {
         contacts.removeAt(index);
         await prefs.setStringList('emergency_contacts', contacts);
         await _loadEmergencyContacts(); // Recargar la lista
-        
+
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text('🗑️ Contacto eliminado'),
@@ -2485,7 +2532,11 @@ class _DrivingScreenState extends State<DrivingScreen>
             padding: const EdgeInsets.symmetric(horizontal: 20),
             child: Row(
               children: [
-                const Icon(Icons.bluetooth_rounded, color: Colors.white, size: 28),
+                const Icon(
+                  Icons.bluetooth_rounded,
+                  color: Colors.white,
+                  size: 28,
+                ),
                 const SizedBox(width: 12),
                 const Expanded(
                   child: Text(
@@ -2498,10 +2549,12 @@ class _DrivingScreenState extends State<DrivingScreen>
                   ),
                 ),
                 ElevatedButton.icon(
-                  onPressed: isScanning ? null : () {
-                    _startBluetoothScan();
-                    setModalState(() {});
-                  },
+                  onPressed: isScanning
+                      ? null
+                      : () {
+                          _startBluetoothScan();
+                          setModalState(() {});
+                        },
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.blue.shade700,
                     foregroundColor: Colors.white,
@@ -2509,16 +2562,16 @@ class _DrivingScreenState extends State<DrivingScreen>
                       borderRadius: BorderRadius.circular(20),
                     ),
                   ),
-                  icon: isScanning 
-                    ? const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.white,
-                        ),
-                      )
-                    : const Icon(Icons.refresh_rounded, size: 18),
+                  icon: isScanning
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Colors.white,
+                          ),
+                        )
+                      : const Icon(Icons.refresh_rounded, size: 18),
                   label: Text(isScanning ? 'Buscando...' : 'Buscar'),
                 ),
               ],
@@ -2539,7 +2592,11 @@ class _DrivingScreenState extends State<DrivingScreen>
               ),
               child: Row(
                 children: [
-                  const Icon(Icons.check_circle_rounded, color: Colors.green, size: 24),
+                  const Icon(
+                    Icons.check_circle_rounded,
+                    color: Colors.green,
+                    size: 24,
+                  ),
                   const SizedBox(width: 12),
                   Expanded(
                     child: Text(
@@ -2554,7 +2611,10 @@ class _DrivingScreenState extends State<DrivingScreen>
                       setState(() {});
                     },
                     icon: const Icon(Icons.close, color: Colors.red, size: 18),
-                    label: const Text('Desconectar', style: TextStyle(color: Colors.red)),
+                    label: const Text(
+                      'Desconectar',
+                      style: TextStyle(color: Colors.red),
+                    ),
                   ),
                 ],
               ),
@@ -2570,15 +2630,17 @@ class _DrivingScreenState extends State<DrivingScreen>
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
                         Icon(
-                          isScanning ? Icons.bluetooth_searching : Icons.bluetooth_disabled,
+                          isScanning
+                              ? Icons.bluetooth_searching
+                              : Icons.bluetooth_disabled,
                           size: 64,
                           color: Colors.grey.shade600,
                         ),
                         const SizedBox(height: 20),
                         Text(
-                          isScanning 
-                            ? 'Buscando dispositivos...'
-                            : 'No se encontraron dispositivos',
+                          isScanning
+                              ? 'Buscando dispositivos...'
+                              : 'No se encontraron dispositivos',
                           style: TextStyle(
                             color: Colors.grey.shade400,
                             fontSize: 18,
@@ -2603,20 +2665,23 @@ class _DrivingScreenState extends State<DrivingScreen>
                     itemBuilder: (context, index) {
                       final result = discoveredDevices[index];
                       final device = result.device;
-                      final isEyesCAS = device.platformName.toLowerCase().contains('eyescas') ||
-                                      device.platformName.toLowerCase().contains('driver');
-                      
+                      final isEyesCAS =
+                          device.platformName.toLowerCase().contains(
+                            'eyescas',
+                          ) ||
+                          device.platformName.toLowerCase().contains('driver');
+
                       return Container(
                         margin: const EdgeInsets.only(bottom: 10),
                         decoration: BoxDecoration(
-                          color: isEyesCAS 
-                            ? Colors.blue.withOpacity(0.2)
-                            : Colors.white.withOpacity(0.05),
+                          color: isEyesCAS
+                              ? Colors.blue.withOpacity(0.2)
+                              : Colors.white.withOpacity(0.05),
                           borderRadius: BorderRadius.circular(15),
                           border: Border.all(
-                            color: isEyesCAS 
-                              ? Colors.blue.withOpacity(0.5)
-                              : Colors.white.withOpacity(0.1),
+                            color: isEyesCAS
+                                ? Colors.blue.withOpacity(0.5)
+                                : Colors.white.withOpacity(0.1),
                           ),
                         ),
                         child: ListTile(
@@ -2627,13 +2692,17 @@ class _DrivingScreenState extends State<DrivingScreen>
                               borderRadius: BorderRadius.circular(8),
                             ),
                             child: Icon(
-                              isEyesCAS ? Icons.remove_red_eye : Icons.bluetooth,
+                              isEyesCAS
+                                  ? Icons.remove_red_eye
+                                  : Icons.bluetooth,
                               color: Colors.white,
                               size: 20,
                             ),
                           ),
                           title: Text(
-                            device.platformName.isEmpty ? 'Dispositivo desconocido' : device.platformName,
+                            device.platformName.isEmpty
+                                ? 'Dispositivo desconocido'
+                                : device.platformName,
                             style: const TextStyle(
                               color: Colors.white,
                               fontWeight: FontWeight.bold,
@@ -2641,12 +2710,17 @@ class _DrivingScreenState extends State<DrivingScreen>
                           ),
                           subtitle: Text(
                             device.remoteId.toString(),
-                            style: TextStyle(color: Colors.grey.shade400, fontSize: 12),
+                            style: TextStyle(
+                              color: Colors.grey.shade400,
+                              fontSize: 12,
+                            ),
                           ),
                           trailing: ElevatedButton(
                             onPressed: () => _connectToDevice(device),
                             style: ElevatedButton.styleFrom(
-                              backgroundColor: isEyesCAS ? Colors.blue : Colors.grey.shade700,
+                              backgroundColor: isEyesCAS
+                                  ? Colors.blue
+                                  : Colors.grey.shade700,
                               foregroundColor: Colors.white,
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(8),
@@ -2777,20 +2851,32 @@ class _DrivingScreenState extends State<DrivingScreen>
             height: 50,
             decoration: BoxDecoration(
               gradient: LinearGradient(
-                colors: [Colors.blue.shade400, Colors.purple.shade400],
+                colors: _warningLevel >= 2
+                    ? [Colors.red.shade400, Colors.red.shade600]
+                    : _warningLevel >= 1
+                    ? [Colors.amber.shade400, Colors.orange.shade600]
+                    : [Colors.blue.shade400, Colors.purple.shade400],
               ),
               borderRadius: BorderRadius.circular(15),
               boxShadow: [
                 BoxShadow(
-                  color: Colors.blue.withOpacity(0.3),
+                  color:
+                      (_warningLevel >= 2
+                              ? Colors.red
+                              : _warningLevel >= 1
+                              ? Colors.orange
+                              : Colors.blue)
+                          .withOpacity(0.3),
                   blurRadius: 10,
                   spreadRadius: 2,
                 ),
               ],
             ),
-            child: const Icon(
+            child: Icon(
               Icons.remove_red_eye,
-              color: Colors.white,
+              color: _warningLevel >= 2
+                  ? Colors.white
+                  : (_warningLevel >= 1 ? Colors.black87 : Colors.white),
               size: 28,
             ),
           ),

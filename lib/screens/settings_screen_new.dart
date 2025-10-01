@@ -32,7 +32,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     try {
       final prefs = await SharedPreferences.getInstance();
       final name = prefs.getString('user_name') ?? '';
-      
+
       setState(() {
         _userName = name;
         _userNameController.text = name;
@@ -47,7 +47,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('user_name', _userNameController.text.trim());
-      
+
       setState(() {
         _userName = _userNameController.text.trim();
       });
@@ -135,9 +135,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                     ],
                   ),
-                  
+
                   const SizedBox(height: 20),
-                  
+
                   // Campo para el nombre
                   const Text(
                     'Nombre completo',
@@ -147,16 +147,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       fontWeight: FontWeight.w600,
                     ),
                   ),
-                  
+
                   const SizedBox(height: 10),
-                  
+
                   TextField(
                     controller: _userNameController,
                     style: const TextStyle(color: Colors.white, fontSize: 16),
                     decoration: InputDecoration(
                       hintText: 'Ingresa tu nombre completo',
                       hintStyle: TextStyle(color: Colors.grey.shade400),
-                      prefixIcon: const Icon(Icons.person_outline, color: Colors.blue),
+                      prefixIcon: const Icon(
+                        Icons.person_outline,
+                        color: Colors.blue,
+                      ),
                       filled: true,
                       fillColor: Colors.white.withOpacity(0.05),
                       border: OutlineInputBorder(
@@ -169,13 +172,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                       focusedBorder: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(12),
-                        borderSide: const BorderSide(color: Colors.blue, width: 2),
+                        borderSide: const BorderSide(
+                          color: Colors.blue,
+                          width: 2,
+                        ),
                       ),
                     ),
                   ),
-                  
+
                   const SizedBox(height: 20),
-                  
+
                   // Botón guardar
                   SizedBox(
                     width: double.infinity,
@@ -193,7 +199,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       icon: const Icon(Icons.save_rounded),
                       label: const Text(
                         'Guardar Información',
-                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
                     ),
                   ),
@@ -243,22 +252,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                     ],
                   ),
-                  
+
                   const SizedBox(height: 15),
-                  
+
                   _buildInfoTile(
                     icon: Icons.bluetooth_rounded,
                     title: 'Conexión Bluetooth',
-                    subtitle: 'Usa el modal de Bluetooth en la pantalla principal',
+                    subtitle:
+                        'Usa el modal de Bluetooth en la pantalla principal',
                     color: Colors.blue,
                   ),
-                  
+
                   const SizedBox(height: 10),
-                  
+
                   _buildInfoTile(
                     icon: Icons.emergency_rounded,
                     title: 'Contactos de Emergencia',
-                    subtitle: 'Gestiona contactos desde el botón en pantalla principal',
+                    subtitle:
+                        'Gestiona contactos desde el botón en pantalla principal',
                     color: Colors.red,
                   ),
                 ],
@@ -325,10 +336,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 const SizedBox(height: 4),
                 Text(
                   subtitle,
-                  style: TextStyle(
-                    color: Colors.grey.shade400,
-                    fontSize: 14,
-                  ),
+                  style: TextStyle(color: Colors.grey.shade400, fontSize: 14),
                 ),
               ],
             ),
