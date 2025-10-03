@@ -1,14 +1,17 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'screens/splash_screen.dart';
-// import 'services/notification_service.dart';
+import 'services/notification_service.dart';
+
+// Clave global para acceder al contexto desde cualquier parte
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   // Inicializar servicios
-  // await NotificationService.initialize();
-  // await NotificationService.requestPermissions();
+  await NotificationService.initialize();
+  await NotificationService.requestPermissions();
 
   runApp(const DriverAssistantApp());
 }
@@ -29,6 +32,7 @@ class DriverAssistantApp extends StatelessWidget {
     );
 
     return MaterialApp(
+      navigatorKey: navigatorKey,
       title: 'EyesCas - Asistente de Conducción',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
