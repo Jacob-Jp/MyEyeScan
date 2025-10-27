@@ -1494,6 +1494,14 @@ class _DrivingScreenState extends State<DrivingScreen>
   // --- LÓGICA DE CONTROL DE PANTALLA ---
 
   void _toggleAssistantService() {
+    // ⬇️ VALIDACIÓN: Verificar que Bluetooth esté conectado antes de iniciar
+    if (!isServiceRunning && !_bluetoothService.isConnected) {
+      // Mostrar advertencia elegante si intenta iniciar sin Bluetooth conectado
+      _showBluetoothRequiredDialog();
+      return; // ❌ No inicia el asistente
+    }
+
+    // ✅ Si está conectado O si está deteniendo el servicio, continuar
     setState(() {
       isServiceRunning = !isServiceRunning;
       if (isServiceRunning) {
@@ -1504,13 +1512,249 @@ class _DrivingScreenState extends State<DrivingScreen>
 
         // Lógica real: Iniciar la comunicación de comandos al ESP32
         // _bluetoothManager.sendCommand('START_MONITORING');
+        
+        // Mostrar confirmación de inicio
+        _showSuccessSnackBar('✅ Asistente de conducción iniciado');
       } else {
         currentDrowsinessLevel = 0.0;
         _triggerEmergencyAlert(false);
         // Lógica real: Detener la comunicación con el ESP32
         // _bluetoothManager.sendCommand('STOP_MONITORING');
+        
+        // Mostrar confirmación de detención
+        _showInfoSnackBar('⏸️ Asistente de conducción detenido');
       }
     });
+  }
+
+  // Diálogo elegante para requerir conexión Bluetooth
+  void _showBluetoothRequiredDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: true,
+      builder: (BuildContext context) {
+        return Dialog(
+          backgroundColor: Colors.transparent,
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 400),
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  Color(0xFF1A1A2E),
+                  Color(0xFF16213E),
+                  Color(0xFF0F3460),
+                ],
+              ),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: Colors.orange.withOpacity(0.5),
+                width: 2,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.orange.withOpacity(0.3),
+                  blurRadius: 20,
+                  spreadRadius: 5,
+                ),
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.5),
+                  blurRadius: 30,
+                  offset: const Offset(0, 10),
+                ),
+              ],
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(28),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Icono con círculo de fondo
+                  Container(
+                    padding: const EdgeInsets.all(18),
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Colors.orange.withOpacity(0.15),
+                      border: Border.all(
+                        color: Colors.orange.withOpacity(0.4),
+                        width: 2,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.orange.withOpacity(0.3),
+                          blurRadius: 15,
+                          spreadRadius: 2,
+                        ),
+                      ],
+                    ),
+                    child: const Icon(
+                      Icons.bluetooth_disabled_rounded,
+                      size: 50,
+                      color: Colors.orange,
+                    ),
+                  ),
+
+                  const SizedBox(height: 24),
+
+                  // Título
+                  const Text(
+                    'Conexión Requerida',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 24,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.5,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+
+                  const SizedBox(height: 14),
+
+                  // Mensaje descriptivo
+                  Text(
+                    'Necesitas conectar el módulo ESP32 mediante Bluetooth para iniciar el asistente de conducción.',
+                    style: TextStyle(
+                      color: Colors.grey.shade300,
+                      fontSize: 15,
+                      height: 1.5,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+
+                  const SizedBox(height: 28),
+
+                  // Botones
+                  Row(
+                    children: [
+                      // Botón Cancelar
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => Navigator.of(context).pop(),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.grey.shade400,
+                            side: BorderSide(
+                              color: Colors.grey.shade600,
+                              width: 1.5,
+                            ),
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                          ),
+                          child: const Text(
+                            'Cancelar',
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ),
+
+                      const SizedBox(width: 12),
+
+                      // Botón Conectar (destacado)
+                      Expanded(
+                        flex: 2,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: [
+                                Colors.blue.shade600,
+                                Colors.blue.shade700,
+                              ],
+                            ),
+                            borderRadius: BorderRadius.circular(12),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.blue.withOpacity(0.4),
+                                blurRadius: 12,
+                                offset: const Offset(0, 4),
+                              ),
+                            ],
+                          ),
+                          child: ElevatedButton.icon(
+                            onPressed: () {
+                              Navigator.of(context).pop();
+                              _showBluetoothModal();
+                            },
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.transparent,
+                              foregroundColor: Colors.white,
+                              shadowColor: Colors.transparent,
+                              padding: const EdgeInsets.symmetric(vertical: 14),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                            icon: const Icon(Icons.bluetooth_rounded, size: 20),
+                            label: const Text(
+                              'Conectar Ahora',
+                              style: TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  // Helpers para SnackBars con estilo
+  void _showSuccessSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.check_circle, color: Colors.white),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                message,
+                style: const TextStyle(fontSize: 15),
+              ),
+            ),
+          ],
+        ),
+        backgroundColor: Colors.green.shade700,
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+    );
+  }
+
+  void _showInfoSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.info_outline, color: Colors.white),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                message,
+                style: const TextStyle(fontSize: 15),
+              ),
+            ),
+          ],
+        ),
+        backgroundColor: Colors.grey.shade700,
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+    );
   }
 
   void _simulateDrowsinessAlert() {

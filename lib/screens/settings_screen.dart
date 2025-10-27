@@ -3,6 +3,7 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'driving_screen.dart';
+import 'camera_test_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -272,11 +273,51 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         'Gestiona contactos desde el botón en pantalla principal',
                     color: Colors.red,
                   ),
+
+                  const SizedBox(height: 10),
+
+                  _buildInfoTile(
+                    icon: Icons.camera_alt,
+                    title: 'Detección IA',
+                    subtitle:
+                        'Sistema de detección de cansancio con cámara',
+                    color: Colors.purple,
+                  ),
                 ],
               ),
             ),
 
             const SizedBox(height: 30),
+
+            // Botón probar IA
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => const CameraTestScreen(),
+                    ),
+                  );
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.purple,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                icon: const Icon(Icons.science_rounded),
+                label: const Text(
+                  '🧠 Probar Detección IA',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 15),
 
             // Botón volver
             SizedBox(
