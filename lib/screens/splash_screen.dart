@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'dart:async';
 import 'dart:math' as math;
 import 'driving_screen.dart';
+import '../services/bluetooth_service.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -26,10 +27,13 @@ class _SplashScreenState extends State<SplashScreen>
   final List<String> _loadingMessages = [
     'Inicializando sistema...',
     'Cargando módulos de seguridad...',
-    'Verificando sensores...',
+    'Buscando módulo ESP32 (opcional)...',
+    'Preparando cámara local...',
     'Preparando asistente IA...',
     'Sistema listo ✓',
   ];
+  
+  final BluetoothService _bluetoothService = BluetoothService();
 
   @override
   void initState() {
@@ -85,12 +89,58 @@ class _SplashScreenState extends State<SplashScreen>
     _rotateController.repeat();
     _pulseController.repeat(reverse: true);
 
-    // Simular etapas de carga con mensajes
-    for (int i = 0; i < _loadingMessages.length; i++) {
-      if (mounted) {
-        setState(() => _loadingStage = i);
-        await Future.delayed(const Duration(milliseconds: 700));
+    // Etapa 0: Inicializando sistema
+    if (mounted) {
+      setState(() => _loadingStage = 0);
+      await Future.delayed(const Duration(milliseconds: 700));
+    }
+
+    // Etapa 1: Cargando módulos
+    if (mounted) {
+      setState(() => _loadingStage = 1);
+      await Future.delayed(const Duration(milliseconds: 700));
+    }
+
+    // Etapa 2: Buscando ESP32 (CONEXIÓN AUTOMÁTICA)
+    if (mounted) {
+      setState(() => _loadingStage = 2);
+      print("🔍 Iniciando búsqueda automática de ESP32...");
+      
+      try {
+        final device = await _bluetoothService.startScan();
+        
+        if (device != null && mounted) {
+          // Etapa 3: Conectando
+          setState(() => _loadingStage = 3);
+          print("📱 Dispositivo encontrado, conectando...");
+          
+          final connected = await _bluetoothService.connectToDevice(device);
+          
+          if (connected) {
+            print("✅ Conexión automática exitosa");
+          } else {
+            print("⚠️ No se pudo conectar automáticamente");
+          }
+        } else {
+          print("⚠️ ESP32 no encontrado, continuando sin conexión");
+        }
+      } catch (e) {
+        print("❌ Error en conexión automática: $e");
       }
+      
+      await Future.delayed(const Duration(milliseconds: 700));
+    }
+
+    // Etapa 4: Preparando IA
+    if (mounted) {
+      setState(() => _loadingStage = 4);
+      await Future.delayed(const Duration(milliseconds: 700));
+    }
+
+    // Etapa 5: Sistema listo
+    if (mounted) {
+      setState(() => _loadingStage = 5);
+      await Future.delayed(const Duration(milliseconds: 700));
     }
 
     // Pequeña pausa final
@@ -235,7 +285,7 @@ class _SplashScreenState extends State<SplashScreen>
                                   ],
                                 ).createShader(bounds),
                                 child: const Text(
-                                  'MyEyeScan',
+                                  'EyeScanDrive',
                                   style: TextStyle(
                                     fontSize: 48,
                                     fontWeight: FontWeight.bold,
@@ -441,7 +491,7 @@ class _SplashScreenState extends State<SplashScreen>
                         ),
                         const SizedBox(height: 5),
                         Text(
-                          '© 2025 MyEyeScan - Tecnología de Seguridad Vial',
+                          '© 2025 EyeScanDrive - Tecnología de Seguridad Vial',
                           style: TextStyle(
                             color: Colors.grey.shade700,
                             fontSize: 10,

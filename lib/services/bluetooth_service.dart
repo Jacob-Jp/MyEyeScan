@@ -2,7 +2,7 @@
 
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart' as fbp;
 import 'package:permission_handler/permission_handler.dart';
 
 class BluetoothService extends ChangeNotifier {
@@ -14,13 +14,25 @@ class BluetoothService extends ChangeNotifier {
   BluetoothService._internal();
 
   // Estados del servicio
-  BluetoothDevice? _connectedDevice;
+  fbp.BluetoothDevice? _connectedDevice;
   String _connectionStatus = "Módulo Desconectado";
   Color _statusColor = Colors.grey.shade600;
   bool _isConnected = false;
+  
+  // Características BLE
+  fbp.BluetoothCharacteristic? _dataCharacteristic;
+  StreamSubscription<List<int>>? _dataSubscription;
+  
+  // Stream de datos recibidos del ESP32
+  final StreamController<String> _dataController = StreamController<String>.broadcast();
+  Stream<String> get dataStream => _dataController.stream;
+  
+  // Timer para reconexión automática
+  Timer? _reconnectionTimer;
+  bool _autoReconnectEnabled = true;
 
   // Getters
-  BluetoothDevice? get connectedDevice => _connectedDevice;
+  fbp.BluetoothDevice? get connectedDevice => _connectedDevice;
   String get connectionStatus => _connectionStatus;
   Color get statusColor => _statusColor;
   bool get isConnected => _isConnected;
@@ -28,7 +40,7 @@ class BluetoothService extends ChangeNotifier {
 
   // Métodos para actualizar el estado
   void updateConnection({
-    BluetoothDevice? device,
+    fbp.BluetoothDevice? device,
     String? status,
     Color? color,
     bool? connected,
@@ -42,6 +54,10 @@ class BluetoothService extends ChangeNotifier {
   }
 
   void disconnect() {
+    _dataSubscription?.cancel();
+    _dataSubscription = null;
+    _dataCharacteristic = null;
+    
     _connectedDevice?.disconnect();
     _connectedDevice = null;
     _connectionStatus = "Módulo Desconectado";
@@ -49,6 +65,42 @@ class BluetoothService extends ChangeNotifier {
     _isConnected = false;
 
     notifyListeners();
+  }
+  
+  @override
+  void dispose() {
+    _reconnectionTimer?.cancel();
+    _dataSubscription?.cancel();
+    _dataController.close();
+    super.dispose();
+  }
+  
+  // Iniciar reconexión automática
+  void startAutoReconnect() {
+    print("🔄 Reconexión automática activada");
+    _autoReconnectEnabled = true;
+    _reconnectionTimer?.cancel();
+    
+    _reconnectionTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
+      if (!_isConnected && _autoReconnectEnabled) {
+        print("🔍 Intentando reconectar automáticamente...");
+        try {
+          final device = await startScan();
+          if (device != null) {
+            await connectToDevice(device);
+          }
+        } catch (e) {
+          print("❌ Error en reconexión automática: $e");
+        }
+      }
+    });
+  }
+  
+  // Detener reconexión automática
+  void stopAutoReconnect() {
+    print("🛑 Reconexión automática desactivada");
+    _autoReconnectEnabled = false;
+    _reconnectionTimer?.cancel();
   }
 
   // Método para verificar si hay conexión activa
@@ -62,7 +114,7 @@ class BluetoothService extends ChangeNotifier {
     try {
       // Verificar el estado real de la conexión
       final connectionState = await _connectedDevice!.connectionState.first;
-      _isConnected = connectionState == BluetoothConnectionState.connected;
+      _isConnected = connectionState == fbp.BluetoothConnectionState.connected;
 
       if (!_isConnected) {
         _connectionStatus = "Módulo Desconectado";
@@ -99,36 +151,46 @@ class BluetoothService extends ChangeNotifier {
   }
 
   // Método para iniciar el escaneo de dispositivos
-  Future<BluetoothDevice?> startScan() async {
+  Future<fbp.BluetoothDevice?> startScan() async {
     updateConnection(status: "Buscando dispositivo...", color: Colors.blue);
 
     try {
+      print("🔍 === INICIANDO ESCANEO BLE ===");
+      
       // Asegurar que el Bluetooth está encendido
-      if (await FlutterBluePlus.isSupported == false) {
+      if (await fbp.FlutterBluePlus.isSupported == false) {
+        print("❌ Bluetooth no soportado");
         throw Exception("Bluetooth no soportado en este dispositivo");
       }
 
       // Verificar si el Bluetooth está encendido
-      if (await FlutterBluePlus.isOn == false) {
+      if (await fbp.FlutterBluePlus.isOn == false) {
+        print("❌ Bluetooth apagado");
         updateConnection(
           status: "Bluetooth apagado. Por favor, enciéndelo.",
           color: Colors.red,
         );
         return null;
       }
+      
+      print("✅ Bluetooth está encendido");
 
       // Solicitar permisos
       final hasPermissions = await requestPermissions();
       if (!hasPermissions) {
+        print("❌ Permisos no otorgados");
         updateConnection(
           status: "Se requieren permisos de Bluetooth",
           color: Colors.red,
         );
         return null;
       }
+      
+      print("✅ Permisos otorgados");
 
       // Detener cualquier escaneo previo
-      await FlutterBluePlus.stopScan();
+      await fbp.FlutterBluePlus.stopScan();
+      print("🛑 Escaneo previo detenido");
 
       // Iniciar nuevo escaneo
       updateConnection(
@@ -136,30 +198,43 @@ class BluetoothService extends ChangeNotifier {
         color: Colors.blue,
       );
 
-      BluetoothDevice? targetDevice;
+      fbp.BluetoothDevice? targetDevice;
+      int devicesFound = 0;
 
       // Suscribirse a los resultados del escaneo
-      final subscription = FlutterBluePlus.scanResults.listen(
+      final subscription = fbp.FlutterBluePlus.scanResults.listen(
         (results) {
-          for (ScanResult result in results) {
-            print("Dispositivo encontrado: \${result.device.platformName}");
-            if (result.device.platformName == TARGET_DEVICE_NAME) {
+          for (fbp.ScanResult result in results) {
+            devicesFound++;
+            final deviceName = result.device.platformName;
+            final deviceId = result.device.remoteId.str;
+            final rssi = result.rssi;
+            
+            print("📱 Dispositivo #$devicesFound:");
+            print("   Nombre: ${deviceName.isEmpty ? '(Sin nombre)' : deviceName}");
+            print("   ID: $deviceId");
+            print("   RSSI: $rssi dBm");
+            print("   Servicios: ${result.advertisementData.serviceUuids}");
+            
+            if (deviceName == TARGET_DEVICE_NAME) {
+              print("🎯 ¡ENCONTRADO! $TARGET_DEVICE_NAME");
               targetDevice = result.device;
-              FlutterBluePlus.stopScan();
+              fbp.FlutterBluePlus.stopScan();
             }
           }
         },
         onError: (error) {
-          print("Error en escaneo: \$error");
+          print("❌ Error en escaneo: $error");
           updateConnection(
-            status: "Error en búsqueda: \$error",
+            status: "Error en búsqueda: $error",
             color: Colors.red,
           );
         },
       );
 
       // Iniciar escaneo
-      await FlutterBluePlus.startScan(
+      print("🔄 Iniciando escaneo BLE (10 segundos)...");
+      await fbp.FlutterBluePlus.startScan(
         timeout: SCAN_DURATION,
         androidUsesFineLocation: true,
       );
@@ -169,29 +244,36 @@ class BluetoothService extends ChangeNotifier {
 
       // Limpiar suscripción
       subscription.cancel();
+      
+      print("⏹️ Escaneo finalizado. Total dispositivos: $devicesFound");
 
       if (targetDevice == null) {
+        print("❌ '$TARGET_DEVICE_NAME' NO encontrado entre $devicesFound dispositivos");
         updateConnection(
-          status: "Dispositivo EyesCAS no encontrado",
+          status: "Dispositivo EyesCAS no encontrado ($devicesFound dispositivos escaneados)",
           color: Colors.orange,
         );
+      } else {
+        print("✅ Dispositivo encontrado: $TARGET_DEVICE_NAME");
       }
 
       return targetDevice;
     } catch (e) {
-      print("Error en escaneo: \$e");
-      updateConnection(status: "Error en búsqueda: \$e", color: Colors.red);
+      print("❌ Error en escaneo: $e");
+      updateConnection(status: "Error en búsqueda: $e", color: Colors.red);
       return null;
     }
   }
 
   // Método para conectar con un dispositivo
-  Future<bool> connectToDevice(BluetoothDevice device) async {
+  Future<bool> connectToDevice(fbp.BluetoothDevice device) async {
     try {
       updateConnection(
-        status: "Conectando a \${device.platformName}...",
+        status: "Conectando a ${device.platformName}...",
         color: Colors.blue,
       );
+
+      print("🔗 Intentando conectar a ${device.platformName}...");
 
       // Intentar conectar
       await device.connect(
@@ -201,16 +283,23 @@ class BluetoothService extends ChangeNotifier {
 
       // Verificar la conexión
       final state = await device.connectionState.first;
-      if (state == BluetoothConnectionState.connected) {
+      if (state == fbp.BluetoothConnectionState.connected) {
+        print("✅ Conectado exitosamente");
+        
         _connectedDevice = device;
         updateConnection(
           device: device,
-          status: "Conectado a \${device.platformName}",
+          status: "Conectado a ${device.platformName}",
           color: Colors.green,
           connected: true,
         );
+        
+        // Descubrir servicios y suscribirse a notificaciones
+        await _discoverServicesAndSubscribe(device);
+        
         return true;
       } else {
+        print("❌ Fallo en conexión");
         updateConnection(
           status: "Fallo en conexión",
           color: Colors.red,
@@ -219,13 +308,95 @@ class BluetoothService extends ChangeNotifier {
         return false;
       }
     } catch (e) {
-      print("Error conectando: \$e");
+      print("❌ Error conectando: $e");
       updateConnection(
-        status: "Error: \$e",
+        status: "Error: $e",
         color: Colors.red,
         connected: false,
       );
       return false;
+    }
+  }
+  
+  // UUIDs del ESP32
+  static const String SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb";
+  static const String CHARACTERISTIC_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb";
+  
+  // Descubrir servicios y suscribirse a notificaciones
+  Future<void> _discoverServicesAndSubscribe(fbp.BluetoothDevice device) async {
+    try {
+      print("🔍 Descubriendo servicios...");
+      
+      // Descubrir servicios
+      List<fbp.BluetoothService> services = await device.discoverServices();
+      print("📋 Servicios encontrados: ${services.length}");
+      
+      for (var service in services) {
+        print("   Service UUID: ${service.uuid}");
+        
+        // Buscar nuestro servicio
+        if (service.uuid.toString().toLowerCase() == SERVICE_UUID.toLowerCase()) {
+          print("   🎯 ¡Servicio EyesCAS encontrado!");
+          
+          for (var characteristic in service.characteristics) {
+            print("      Characteristic: ${characteristic.uuid}");
+            
+            // Buscar nuestra característica
+            if (characteristic.uuid.toString().toLowerCase() == CHARACTERISTIC_UUID.toLowerCase()) {
+              print("      🎯 ¡Característica de datos encontrada!");
+              _dataCharacteristic = characteristic;
+              
+              // Verificar si soporta notificaciones
+              if (characteristic.properties.notify) {
+                print("      📡 Activando notificaciones...");
+                
+                // Suscribirse a notificaciones
+                await characteristic.setNotifyValue(true);
+                
+                // Escuchar los datos
+                _dataSubscription = characteristic.lastValueStream.listen(
+                  (value) {
+                    if (value.isNotEmpty) {
+                      final data = String.fromCharCodes(value);
+                      print("📥 Datos recibidos: $data");
+                      _dataController.add(data);
+                    }
+                  },
+                  onError: (error) {
+                    print("❌ Error recibiendo datos: $error");
+                  },
+                );
+                
+                print("      ✅ Suscripción a notificaciones activa");
+              } else {
+                print("      ⚠️ Característica no soporta notificaciones");
+              }
+            }
+          }
+        }
+      }
+      
+      if (_dataCharacteristic == null) {
+        print("⚠️ No se encontró la característica de datos");
+      }
+      
+    } catch (e) {
+      print("❌ Error descubriendo servicios: $e");
+    }
+  }
+  
+  // Enviar datos al ESP32 (opcional, para comandos futuros)
+  Future<void> sendData(String data) async {
+    if (_dataCharacteristic == null) {
+      print("❌ No hay característica disponible para enviar datos");
+      return;
+    }
+    
+    try {
+      await _dataCharacteristic!.write(data.codeUnits);
+      print("📤 Datos enviados: $data");
+    } catch (e) {
+      print("❌ Error enviando datos: $e");
     }
   }
 }

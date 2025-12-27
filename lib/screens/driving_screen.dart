@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:battery_plus/battery_plus.dart';
@@ -8,15 +10,31 @@ import 'package:geocoding/geocoding.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:camera/camera.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:fl_chart/fl_chart.dart';
+import 'package:uuid/uuid.dart';
 
 import 'settings_screen.dart'; // La pantalla de configuración
+import 'user_profile_screen.dart'; // La pantalla de perfil de usuario
+import 'emergency_contact_screen.dart'; // Configuración de contacto de emergencia
+import 'trip_history_screen.dart'; // Historial de viajes
 import '../services/bluetooth_service.dart' as bt_service;
 import '../services/notification_service.dart';
+import '../services/drowsiness_detection_service.dart';
+import '../services/emergency_service.dart';
+import '../services/trip_history_service.dart';
+import '../services/voice_assistant_service.dart'; // Nuevo: Asistente de voz
+import '../services/firebase_sync_service.dart'; // Servicio CSV local (no Firebase)
+import '../services/postgres_service.dart'; // Servicio PostgreSQL
+import '../models/emergency_contact.dart'; // Modelo de contacto de emergencia
+import '../models/trip_data_model.dart'; // Modelo de viaje para CSV Pentaho
 
 // --- CONSTANTES BLUETOOTH (DEBEN COINCIDIR CON EL ESP32) ---
 const String TARGET_DEVICE_NAME = "EyesCAS-Driver";
 const String DATA_SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb";
 const String DATA_CHARACTERISTIC_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb";
+const String VIDEO_CHARACTERISTIC_UUID = "0000ffe2-0000-1000-8000-00805f9b34fb"; // Nueva para video
 
 // UUIDs ALTERNATIVOS COMUNES PARA ESP32
 const List<String> ALTERNATIVE_SERVICE_UUIDS = [
@@ -49,12 +67,46 @@ class _DrivingScreenState extends State<DrivingScreen>
   final Battery _battery = Battery();
   final bt_service.BluetoothService _bluetoothService =
       bt_service.BluetoothService();
+  final DrowsinessDetectionService _detectionService = 
+      DrowsinessDetectionService();
+  final EmergencyService _emergencyService = EmergencyService();
+  final TripHistoryService _tripHistoryService = TripHistoryService();
+  final VoiceAssistantService _voiceAssistant = VoiceAssistantService(); // Nuevo: Asistente de voz
+  
+  // Cámara para detección local
+  CameraController? _cameraController;
+  bool _isCameraInitialized = false;
+  StreamSubscription<DetectionResult>? _detectionSubscription;
+  
+  // Suscripción al stream de datos BLE del ESP32
+  StreamSubscription? _bleDataSubscription;
+  StreamSubscription? _bleVideoSubscription;
+  
+  // Sistema de suavizado para la barra (promedio móvil)
+  final List<double> _drowsinessHistory = [];
+  final int _historyMaxSize = 25; // Buffer más grande para mejor estabilidad
+  final double _maxChangePerFrame = 0.015; // Máximo 1.5% de cambio por frame
+  
+  // Control de tasa de datos (throttling)
+  DateTime _lastDataProcessTime = DateTime.now();
+  final Duration _minDataInterval = Duration(milliseconds: 200); // Máximo 5 datos/segundo
+  int _droppedFramesCount = 0;
+  
+  // Control de throttling para cámara local
+  DateTime _lastCameraProcessTime = DateTime.now();
+  final Duration _minCameraInterval = Duration(milliseconds: 200); // Máximo 5 FPS para IA
+  int _droppedCameraFrames = 0;
 
   // Variables para manejo de alerta
   bool _isAlertActive = false;
   late AudioPlayer _audioPlayer;
+  late AudioPlayer _criticalAudioPlayer; // Para sonido de ambulancia
   Timer? _emergencyTimer;
   bool _emergencySequenceStarted = false;
+  bool _isCriticalSoundPlaying = false;
+  bool _criticalSoundManuallyStopped = false; // Para evitar que vuelva a sonar si el usuario lo pausó
+  Timer? _emergencyAutoCallTimer; // Timer para llamada automática
+  int _emergencyCountdownSeconds = 30; // Contador de segundos para llamada automática
 
   // Sistema de niveles de alerta
   Timer? _warningTimer;
@@ -74,12 +126,23 @@ class _DrivingScreenState extends State<DrivingScreen>
   late Animation<double> _statusAnimation;
 
   // --- CONFIGURACIÓN DE EMERGENCIA ---
-  // Lista de contactos que se carga desde SharedPreferences
-  List<String> _emergencyContacts = [];
+  // NOTA: Sistema antiguo deshabilitado - ahora usamos EmergencyService
+  // List<String> _emergencyContacts = [];
 
   // --- VARIABLES DE ESTADO ---
   bool isServiceRunning = false;
   double currentDrowsinessLevel = 0.0;
+  DetectionResult? _currentDetection;
+  String _detectionMessage = 'Sin detección activa';
+  
+  // Modo nocturno automático
+  bool _isNightMode = false;
+  Timer? _nightModeTimer;
+  
+  // Detector de parpadeo prolongado
+  int _consecutiveBlinkFrames = 0;
+  DateTime? _lastBlinkTime;
+  final int _blinkThreshold = 10; // Frames consecutivos para considerar parpadeo prolongado
 
   // Variables que se actualizan desde el servicio Bluetooth:
   bool get isBluetoothConnected => _bluetoothService.isConnected;
@@ -90,6 +153,25 @@ class _DrivingScreenState extends State<DrivingScreen>
   int batteryLevel = 0;
   String _currentLocation = 'Ubicación no disponible';
 
+  // --- TRACKING DE VIAJE PARA FIREBASE ---
+  String? _currentTripId;
+  DateTime? _tripStartTime;
+  int _currentTripAlerts = 0;
+  int _currentTripWarnings = 0;
+  int _currentTripCritical = 0;
+  int _currentTripEmergencyCalls = 0;
+  double _maxDrowsinessInTrip = 0.0;
+  double _sumDrowsinessLevels = 0.0;
+  int _drowsinessReadingsCount = 0;
+  int _eyesClosedEventsCount = 0;
+  int _yawningEventsCount = 0;
+  Timer? _snapshotTimer; // Timer para guardar snapshots cada minuto
+  List<Map<String, dynamic>> _tripSnapshots = [];
+
+  // --- DATOS PARA GRÁFICO EN TIEMPO REAL ---
+  List<FlSpot> _drowsinessChartData = [];
+  final int _maxChartPoints = 60; // Mostrar últimos 60 puntos
+
   // --- LÓGICA DE INTERFAZ Y ESTADO ---
   Color get statusColor {
     return _getWarningLevelColor();
@@ -98,10 +180,13 @@ class _DrivingScreenState extends State<DrivingScreen>
   String get mainStatusMessage {
     if (!isServiceRunning) return "Asistente detenido. Presiona INICIAR.";
 
-    // Aquí no hay animación de "Buscando...", ya que esto se hace en SettingsScreen
+    // Mostrar mensaje de detección de IA si está activo
+    if (_currentDetection != null) {
+      return _detectionMessage;
+    }
 
-    if (currentDrowsinessLevel >= 0.75) return "¡ALERTA CRÍTICA! DETENTE AHORA";
-    if (currentDrowsinessLevel >= 0.40) return "ATENCIÓN: Se detecta cansancio";
+    if (currentDrowsinessLevel >= 0.80) return "¡ALERTA CRÍTICA! DETENTE AHORA";
+    if (currentDrowsinessLevel >= 0.60) return "ATENCIÓN: Se detecta cansancio";
     return "Analizando: Conducción Segura";
   }
 
@@ -109,19 +194,28 @@ class _DrivingScreenState extends State<DrivingScreen>
   void initState() {
     super.initState();
     _audioPlayer = AudioPlayer();
+    _criticalAudioPlayer = AudioPlayer(); // Inicializar player para ambulancia
     _initAnimations();
     _initBatteryListener();
     _getBatteryLevel();
-    _loadEmergencyContacts();
+    // _loadEmergencyContacts(); // Deshabilitado - ahora usa EmergencyService
 
     // Escuchar cambios en el estado del Bluetooth
     _bluetoothService.addListener(_onBluetoothStateChanged);
 
     // Iniciar reconexión automática
     _startAutoReconnect();
+    
+    // Inicializar detección de IA
+    _initializeDetection();
+    
+    // Iniciar detector de modo nocturno
+    _startNightModeDetector();
   }
 
+  // SISTEMA ANTIGUO DESHABILITADO - Ahora usa EmergencyService
   // Cargar contactos de emergencia desde SharedPreferences
+  /*
   Future<void> _loadEmergencyContacts() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -148,6 +242,213 @@ class _DrivingScreenState extends State<DrivingScreen>
     } catch (e) {
       print('Error cargando contactos: $e');
     }
+  }
+  */
+  
+  // Inicializar sistema de detección de IA
+  Future<void> _initializeDetection() async {
+    try {
+      debugPrint('🧠 Inicializando sistema de detección IA...');
+      
+      // 1. Inicializar asistente de voz
+      final voiceInitialized = await _voiceAssistant.initialize();
+      if (voiceInitialized) {
+        debugPrint('✅ Asistente de voz inicializado');
+        await _voiceAssistant.announceEvent('start');
+      } else {
+        debugPrint('⚠️ No se pudo inicializar asistente de voz');
+      }
+      
+      // 2. Inicializar modelo ONNX
+      const modelPath = 'assets/models/somnolencia_export.onnx';
+      final modelInitialized = await _detectionService.initialize(modelPath);
+      
+      if (!modelInitialized) {
+        debugPrint('❌ No se pudo inicializar el modelo ONNX');
+        return;
+      }
+      
+      debugPrint('✅ Modelo ONNX inicializado');
+      
+      // 3. Solicitar permisos de cámara
+      final cameraStatus = await Permission.camera.request();
+      if (cameraStatus != PermissionStatus.granted) {
+        debugPrint('⚠️ Permiso de cámara no otorgado');
+        return;
+      }
+      
+      // 4. Inicializar cámara frontal
+      final cameras = await availableCameras();
+      if (cameras.isEmpty) {
+        debugPrint('❌ No se encontraron cámaras');
+        return;
+      }
+      
+      final frontCamera = cameras.firstWhere(
+        (camera) => camera.lensDirection == CameraLensDirection.front,
+        orElse: () => cameras.first,
+      );
+      
+      _cameraController = CameraController(
+        frontCamera,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420,
+      );
+      
+      await _cameraController!.initialize();
+      
+      // Esperar a que el sistema esté completamente listo
+      await Future.delayed(const Duration(milliseconds: 500));
+      
+      if (mounted) {
+        setState(() {
+          _isCameraInitialized = true;
+        });
+      }
+      
+      debugPrint('✅ Cámara inicializada');
+      
+      // 5. Escuchar resultados de detección
+      _detectionSubscription = _detectionService.resultStream.listen((result) {
+        if (mounted && isServiceRunning) {
+          setState(() {
+            _currentDetection = result;
+            currentDrowsinessLevel = result.confidence;
+            _detectionMessage = result.message;
+          });
+          
+          // Reproducir sonido de ambulancia si está en estado crítico
+          _handleCriticalSound(result.confidence);
+          
+          // Registrar nivel de somnolencia en historial de viaje
+          _tripHistoryService.recordDrowsinessLevel(result.confidence);
+          
+          // === TRACKING PARA FIREBASE ===
+          if (_currentTripId != null) {
+            // Contar eventos de ojos cerrados
+            if (result.eyesClosed) {
+              _eyesClosedEventsCount++;
+            }
+            // Contar eventos de bostezos
+            if (result.yawning) {
+              _yawningEventsCount++;
+            }
+          }
+          
+          // Verificar parpadeo prolongado
+          _checkBlinkDuration(result);
+          
+          // Actualizar sistema de alertas según el nivel
+          _updateAlertSystem(result.confidence);
+          
+          // 🔊 NUEVO: Anunciar detección con asistente de voz
+          if (_voiceAssistant.isInitialized) {
+            _voiceAssistant.announceDetection(result);
+          }
+        }
+      });
+      
+      debugPrint('✅ Sistema de detección IA listo');
+      
+    } catch (e) {
+      debugPrint('❌ Error inicializando detección: $e');
+    }
+  }
+  
+  // Iniciar detección con cámara
+  Future<void> _startCameraDetection() async {
+    if (!_isCameraInitialized || _cameraController == null) {
+      debugPrint('⚠️ Cámara no inicializada');
+      return;
+    }
+    
+    // Verificar que la cámara esté completamente lista
+    if (!_cameraController!.value.isInitialized) {
+      debugPrint('⚠️ CameraController no está completamente inicializado');
+      return;
+    }
+    
+    try {
+      // Esperar un momento para asegurar que todos los recursos estén listos
+      await Future.delayed(const Duration(milliseconds: 500));
+      
+      // Verificar si ya hay un stream activo
+      if (_cameraController!.value.isStreamingImages) {
+        debugPrint('⚠️ Ya hay un stream activo, deteniéndolo primero');
+        await _cameraController!.stopImageStream();
+        await Future.delayed(const Duration(milliseconds: 300));
+      }
+      
+      await _cameraController!.startImageStream((CameraImage image) async {
+        if (isServiceRunning) {
+          // ===== THROTTLING: Limitar procesamiento de frames de cámara =====
+          final now = DateTime.now();
+          final timeSinceLastProcess = now.difference(_lastCameraProcessTime);
+          
+          if (timeSinceLastProcess < _minCameraInterval) {
+            _droppedCameraFrames++;
+            // Log cada 100 frames descartados para no saturar
+            if (_droppedCameraFrames % 100 == 0) {
+              debugPrint("⚡ Cámara throttling - descartados: $_droppedCameraFrames frames");
+            }
+            return; // Descartar este frame si llega muy rápido
+          }
+          
+          _lastCameraProcessTime = now;
+          await _detectionService.processFrame(image);
+        }
+      });
+      
+      debugPrint('🎥 Detección con cámara iniciada');
+    } catch (e) {
+      debugPrint('❌ Error iniciando stream de cámara: $e');
+      // Reintentar una vez después de un delay
+      await Future.delayed(const Duration(seconds: 1));
+      try {
+        await _cameraController!.startImageStream((CameraImage image) async {
+          if (isServiceRunning) {
+            // ===== THROTTLING en segundo intento también =====
+            final now = DateTime.now();
+            final timeSinceLastProcess = now.difference(_lastCameraProcessTime);
+            
+            if (timeSinceLastProcess < _minCameraInterval) {
+              _droppedCameraFrames++;
+              return;
+            }
+            
+            _lastCameraProcessTime = now;
+            await _detectionService.processFrame(image);
+          }
+        });
+        debugPrint('🎥 Detección con cámara iniciada (segundo intento)');
+      } catch (e2) {
+        debugPrint('❌ Error en segundo intento: $e2');
+      }
+    }
+  }
+  
+  // Detener detección con cámara
+  Future<void> _stopCameraDetection() async {
+    if (_cameraController == null) return;
+    
+    try {
+      // Verificar si hay stream activo antes de detener
+      if (_cameraController!.value.isStreamingImages) {
+        await _cameraController!.stopImageStream();
+        debugPrint('⏸️ Detección con cámara detenida');
+      } else {
+        debugPrint('ℹ️ No hay stream activo para detener');
+      }
+    } catch (e) {
+      debugPrint('❌ Error deteniendo stream: $e');
+    }
+  }
+  
+  // Actualizar sistema de alertas basado en el nivel de confianza del modelo
+  void _updateAlertSystem(double confidence) {
+    // Llamar al sistema de niveles de alerta existente
+    _handleWarningLevel(confidence);
   }
 
   void _initAnimations() {
@@ -184,12 +485,233 @@ class _DrivingScreenState extends State<DrivingScreen>
     _statusController.forward();
   }
 
+  // === DETECTOR DE MODO NOCTURNO AUTOMÁTICO ===
+  void _startNightModeDetector() {
+    _nightModeTimer = Timer.periodic(const Duration(minutes: 1), (timer) {
+      final hour = DateTime.now().hour;
+      
+      // Modo nocturno entre 20:00 (8 PM) y 06:00 (6 AM)
+      final shouldBeNightMode = hour >= 20 || hour < 6;
+      
+      if (shouldBeNightMode != _isNightMode && mounted) {
+        setState(() {
+          _isNightMode = shouldBeNightMode;
+        });
+        
+        print(_isNightMode 
+            ? "🌙 Modo nocturno activado automáticamente" 
+            : "☀️ Modo diurno activado automáticamente");
+      }
+    });
+  }
+
+  // === DETECTOR DE PARPADEO PROLONGADO ===
+  void _checkBlinkDuration(DetectionResult result) {
+    // Si los ojos están cerrados o hay detección de somnolencia alta
+    if (result.confidence > 0.7 || result.message.contains('cerrados')) {
+      _consecutiveBlinkFrames++;
+      
+      // Si supera el umbral, es un parpadeo prolongado (señal de cansancio)
+      if (_consecutiveBlinkFrames >= _blinkThreshold) {
+        final now = DateTime.now();
+        
+        // Evitar alertas repetidas (mínimo 5 segundos entre alertas)
+        if (_lastBlinkTime == null || 
+            now.difference(_lastBlinkTime!).inSeconds >= 5) {
+          
+          _lastBlinkTime = now;
+          print("👁️ ¡ALERTA! Parpadeo prolongado detectado - posible cansancio");
+          
+          // Registrar como alerta en el historial
+          _tripHistoryService.recordAlert(false);
+          
+          // Vibración de advertencia
+          HapticFeedback.mediumImpact();
+          
+          // Mostrar mensaje al usuario
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: const Row(
+                  children: [
+                    Icon(Icons.remove_red_eye, color: Colors.white),
+                    SizedBox(width: 8),
+                    Text('Parpadeo prolongado detectado'),
+                  ],
+                ),
+                backgroundColor: Colors.orange,
+                duration: const Duration(seconds: 2),
+              ),
+            );
+          }
+        }
+      }
+    } else {
+      // Resetear contador si los ojos están abiertos
+      _consecutiveBlinkFrames = 0;
+    }
+  }
+
+  // === GESTIÓN DE VIAJES ===
+  Future<void> _startTrip() async {
+    if (_tripHistoryService.isTripActive) return;
+    
+    // Obtener ubicación actual
+    String? location;
+    try {
+      location = _currentLocation != 'Ubicación no disponible' 
+          ? _currentLocation 
+          : null;
+    } catch (e) {
+      location = null;
+    }
+    
+    // Iniciar viaje en TripHistoryService (local)
+    await _tripHistoryService.startTrip(location);
+    
+    // Iniciar tracking para Firebase
+    _currentTripId = const Uuid().v4();
+    _tripStartTime = DateTime.now();
+    _currentTripAlerts = 0;
+    _currentTripWarnings = 0;
+    _currentTripCritical = 0;
+    _currentTripEmergencyCalls = 0;
+    _maxDrowsinessInTrip = 0.0;
+    _sumDrowsinessLevels = 0.0;
+    _drowsinessReadingsCount = 0;
+    _eyesClosedEventsCount = 0;
+    _yawningEventsCount = 0;
+    _tripSnapshots = [];
+    _drowsinessChartData = [];
+    
+    // Iniciar timer para guardar snapshots cada minuto
+    _snapshotTimer = Timer.periodic(const Duration(minutes: 1), (timer) {
+      _saveSnapshot();
+    });
+    
+    print("🚗 Viaje iniciado - ID: $_currentTripId");
+    print("   Ubicación: ${location ?? 'desconocida'}");
+  }
+
+  Future<void> _endTrip() async {
+    if (!_tripHistoryService.isTripActive) return;
+    
+    // Finalizar viaje en TripHistoryService (local)
+    await _tripHistoryService.endTrip();
+    
+    // Cancelar timer de snapshots
+    _snapshotTimer?.cancel();
+    
+    // Subir datos a Firebase
+    await _uploadTripToFirebase();
+    
+    print("🏁 Viaje finalizado y subido a Firebase");
+  }
+  
+  /// Guardar snapshot de datos cada minuto
+  void _saveSnapshot() {
+    if (_currentTripId == null) return;
+    
+    _tripSnapshots.add({
+      'timestamp': DateTime.now().toIso8601String(),
+      'drowsinessLevel': currentDrowsinessLevel,
+      'eyesClosed': _currentDetection?.eyesClosed ?? false,
+      'yawning': _currentDetection?.yawning ?? false,
+      'location': _currentLocation,
+    });
+  }
+  
+  /// Subir viaje completo a CSV local para ETL Pentaho
+  Future<void> _uploadTripToFirebase() async {
+    if (_currentTripId == null || _tripStartTime == null) return;
+    
+    try {
+      // Obtener datos del usuario
+      final prefs = await SharedPreferences.getInstance();
+      final userName = prefs.getString('user_name') ?? 'Usuario';
+      final userLastName = prefs.getString('user_lastname') ?? 'Anónimo';
+      final userCity = prefs.getString('user_city') ?? 'Desconocido';
+      final userId = prefs.getString('user_id') ?? const Uuid().v4();
+      
+      // Si no existe user_id, generarlo y guardarlo
+      if (!prefs.containsKey('user_id')) {
+        await prefs.setString('user_id', userId);
+      }
+      
+      // Obtener ubicación final
+      String? endLocation;
+      try {
+        endLocation = _currentLocation != 'Ubicación no disponible' 
+            ? _currentLocation 
+            : null;
+      } catch (e) {
+        endLocation = null;
+      }
+      
+      // Calcular promedio de somnolencia
+      final avgDrowsiness = _drowsinessReadingsCount > 0
+          ? _sumDrowsinessLevels / _drowsinessReadingsCount
+          : 0.0;
+      
+      // Crear modelo de viaje
+      final trip = TripDataModel(
+        tripId: _currentTripId!,
+        userId: userId,
+        userName: userName,
+        userLastName: userLastName,
+        userCity: userCity,
+        startTime: _tripStartTime!,
+        endTime: DateTime.now(),
+        startLocation: _currentLocation,
+        endLocation: endLocation,
+        totalAlerts: _currentTripAlerts,
+        warningAlerts: _currentTripWarnings,
+        criticalAlerts: _currentTripCritical,
+        emergencyCalls: _currentTripEmergencyCalls,
+        maxDrowsinessLevel: _maxDrowsinessInTrip,
+        avgDrowsinessLevel: avgDrowsiness,
+        eyesClosedEvents: _eyesClosedEventsCount,
+        yawningEvents: _yawningEventsCount,
+        tripDuration: DateTime.now().difference(_tripStartTime!),
+        snapshots: _tripSnapshots.map((s) => DrowsinessSnapshot(
+          timestamp: DateTime.parse(s['timestamp']),
+          drowsinessLevel: s['drowsinessLevel'],
+          eyesClosed: s['eyesClosed'],
+          yawning: s['yawning'],
+          location: s['location'],
+        )).toList(),
+      );
+      
+      // Guardar en PostgreSQL y CSV
+      try {
+        await PostgresService().saveTrip(trip);
+        print("✅ Viaje guardado en PostgreSQL");
+      } catch (e) {
+        print("⚠️ Error guardando en PostgreSQL: $e");
+      }
+      
+      // Siempre guardar en CSV (respaldo y exportación)
+      try {
+        await CsvExportService().saveTrip(trip);
+        print("✅ Viaje guardado en CSV");
+      } catch (e) {
+        print("⚠️ Error guardando en CSV: $e");
+      }
+    } catch (e) {
+      print("❌ Error guardando viaje: $e");
+    }
+  }
+
   // ✅ Reconexión automática de Bluetooth
   Timer? _reconnectTimer;
   bool _isReconnecting = false;
   String? _lastKnownDeviceId;
 
   void _startAutoReconnect() {
+    // Activar reconexión automática en el servicio Bluetooth
+    _bluetoothService.startAutoReconnect();
+    
+    // Timer adicional local para verificación
     _reconnectTimer = Timer.periodic(const Duration(seconds: 10), (timer) {
       if (!_bluetoothService.isConnected && !_isReconnecting && mounted) {
         _attemptReconnection();
@@ -254,6 +776,11 @@ class _DrivingScreenState extends State<DrivingScreen>
   void dispose() {
     // Primero remover los listeners para evitar llamadas después del dispose
     _bluetoothService.removeListener(_onBluetoothStateChanged);
+    _detectionSubscription?.cancel();
+    
+    // Cancelar suscripciones BLE (muy importante para evitar memory leaks)
+    _bleDataSubscription?.cancel();
+    _bleVideoSubscription?.cancel();
 
     // Detener timer de reconexión
     _reconnectTimer?.cancel();
@@ -262,15 +789,28 @@ class _DrivingScreenState extends State<DrivingScreen>
     _warningTimer?.cancel();
     _criticalTimer?.cancel();
     _emergencyTimer?.cancel();
+    _nightModeTimer?.cancel();
 
     // Detener cualquier alerta activa
     _stopAlert();
+    
+    // Liberar recursos de cámara y detección
+    _cameraController?.dispose();
+    _detectionService.dispose();
+    
+    // Limpiar servicios de emergencia e historial
+    _emergencyService.dispose();
+    
+    // 🔊 NUEVO: Liberar recursos del asistente de voz
+    _voiceAssistant.dispose();
 
     // Luego limpiar los controllers y recursos
     _pulseController.dispose();
     _alertController.dispose();
     _statusController.dispose();
     _audioPlayer.dispose();
+    _criticalAudioPlayer.dispose(); // Liberar audio de ambulancia
+    _cancelEmergencyAutoCallTimer(); // Cancelar timer de llamada automática
 
     super.dispose();
   }
@@ -319,11 +859,8 @@ class _DrivingScreenState extends State<DrivingScreen>
     if (!_isAlertActive) {
       _isAlertActive = true;
 
-      // Mostrar notificación de alerta crítica
-      await NotificationService.showEmergencyNotification(
-        title: '¡ALERTA CRÍTICA DE SOMNOLENCIA!',
-        body: 'Se detectó alto nivel de somnolencia. ¡Detente inmediatamente!',
-      );
+      // NO enviar notificaciones (no funcionan)
+      print("🚨 Iniciando alerta crítica con sonido y vibración");
 
       // Reproducir sonido de alerta
       _playAlertSound();
@@ -347,13 +884,8 @@ class _DrivingScreenState extends State<DrivingScreen>
 
           await Future.delayed(const Duration(milliseconds: 500));
 
-          // Repetir notificación si la alerta sigue activa
-          if (_isAlertActive) {
-            await NotificationService.showEmergencyNotification(
-              title: '¡CONDUCTOR EN RIESGO!',
-              body: 'Nivel crítico de somnolencia. ¡Es necesario detenerse!',
-            );
-          }
+          // NO repetir notificaciones (no funcionan)
+          // El sonido y vibración son suficientes
         }
       }
     }
@@ -450,252 +982,166 @@ class _DrivingScreenState extends State<DrivingScreen>
     }
   }
 
-  // Envía la alerta SMS al primer contacto de la lista con múltiples opciones de respaldo
-  Future<void> _sendSmsAlert(String location) async {
-    if (_emergencyContacts.isEmpty) {
-      print("No hay contactos de emergencia configurados.");
-      _showEmergencyDialog(
-        "No hay contactos de emergencia configurados. Ve a Configuración para agregar contactos.",
-      );
-      return;
-    }
 
-    final String messageBody =
-        "🚨 ALERTA CANSANCIO CRÍTICO! El conductor necesita detenerse inmediatamente. Ubicación: $location. Por favor contactar AHORA.";
-    final String contact = _emergencyContacts.first.replaceAll(' ', '');
+  // Métodos de emergencia removidos - ahora usa EmergencyService
 
-    // PASO 1: LLAMADA AUTOMÁTICA INMEDIATA (sin esperar respuesta del usuario)
-    print("🚨 INICIANDO LLAMADA AUTOMÁTICA DE EMERGENCIA...");
-    await _makeAutomaticEmergencyCall(contact);
-
-    // PASO 2: Copiar información al portapapeles como respaldo
-    final String clipboardText =
-        "EMERGENCIA: $messageBody\nContactar urgente: $contact\nUbicación: $location";
-
-    await Clipboard.setData(ClipboardData(text: clipboardText));
-    print("📋 Información copiada al portapapeles");
-
-    // PASO 3: Enviar WhatsApp automáticamente
-    await _sendWhatsAppAlert(contact, messageBody);
-
-    // PASO 4: Mostrar diálogo con opciones adicionales
-    _showAdvancedEmergencyDialog(messageBody, contact, location);
-  }
-
-  // Realizar llamada automática de emergencia sin intervención del usuario
-  Future<void> _makeAutomaticEmergencyCall(String contact) async {
-    try {
-      final String cleanContact = contact
-          .replaceAll(' ', '')
-          .replaceAll('+', '');
-      print("📞 Intentando llamada automática a: $cleanContact");
-
-      // Intentar llamada directa
-      final Uri phoneUri = Uri.parse('tel:+$cleanContact');
-
-      if (await canLaunchUrl(phoneUri)) {
-        await launchUrl(phoneUri, mode: LaunchMode.externalApplication);
-        print("✅ Llamada automática iniciada exitosamente");
-
-        // Reproducir sonido de confirmación
-        await SystemSound.play(SystemSoundType.alert);
-
-        // Vibración de confirmación
-        await HapticFeedback.mediumImpact();
-        await Future.delayed(const Duration(milliseconds: 100));
-        await HapticFeedback.mediumImpact();
-      } else {
-        print("❌ No se puede hacer la llamada automática");
-        // Intentar método alternativo
-        await _tryAlternativeCallMethod(cleanContact);
-      }
-    } catch (e) {
-      print("❌ Error en llamada automática: $e");
-      // Si falla la llamada automática, al menos intentar abrir el marcador
-      await _openDialerWithNumber(contact);
-    }
-  }
-
-  // Método alternativo para llamadas cuando falla el principal
-  Future<void> _tryAlternativeCallMethod(String contact) async {
-    try {
-      // Intentar sin el prefijo +
-      final Uri phoneUri2 = Uri.parse('tel:$contact');
-      if (await canLaunchUrl(phoneUri2)) {
-        await launchUrl(phoneUri2, mode: LaunchMode.externalApplication);
-        print("✅ Llamada alternativa iniciada");
-      } else {
-        await _openDialerWithNumber(contact);
-      }
-    } catch (e) {
-      print("❌ Error en método alternativo: $e");
-      await _openDialerWithNumber(contact);
-    }
-  }
-
-  // Abrir marcador con el número prellenado
-  Future<void> _openDialerWithNumber(String contact) async {
-    try {
-      final Uri dialerUri = Uri.parse('tel:$contact');
-      await launchUrl(dialerUri, mode: LaunchMode.externalApplication);
-      print("� Marcador abierto con número: $contact");
-    } catch (e) {
-      print("❌ Error abriendo marcador: $e");
-    }
-  }
-
-  // Enviar WhatsApp automático
-  Future<void> _sendWhatsAppAlert(String contact, String message) async {
-    try {
-      // Limpiar formato del contacto (remover caracteres especiales y agregar código de país)
-      String cleanContact = contact.replaceAll(RegExp(r'[^\d]'), '');
-
-      // Agregar código de país si no lo tiene
-      if (!cleanContact.startsWith('52')) {
-        cleanContact = '52$cleanContact'; // Código de México
-      }
-
-      print("💬 Enviando WhatsApp automático a: $cleanContact");
-
-      final String encodedMessage = Uri.encodeComponent(message);
-      bool success = false;
-
-      // Método 1: Intent directo de Android (más confiable)
-      try {
-        final Uri androidIntent = Uri.parse(
-          'intent://send?phone=$cleanContact&text=$encodedMessage#Intent;scheme=whatsapp;package=com.whatsapp;end',
-        );
-        print("🔍 Probando Intent directo de Android");
-
-        if (await canLaunchUrl(androidIntent)) {
-          await launchUrl(androidIntent, mode: LaunchMode.externalApplication);
-          print("✅ WhatsApp abierto con Intent directo");
-          success = true;
-        }
-      } catch (e) {
-        print("❌ Intent directo falló: $e");
-      }
-
-      // Método 2: Esquemas tradicionales si el Intent falla
-      if (!success) {
-        List<String> whatsappUrls = [
-          'whatsapp://send?phone=$cleanContact&text=$encodedMessage',
-          'https://wa.me/$cleanContact?text=$encodedMessage',
-          'https://api.whatsapp.com/send?phone=$cleanContact&text=$encodedMessage',
-        ];
-
-        for (String urlString in whatsappUrls) {
-          try {
-            final Uri uri = Uri.parse(urlString);
-            print("🔍 Probando: $urlString");
-
-            if (await canLaunchUrl(uri)) {
-              await launchUrl(uri, mode: LaunchMode.externalApplication);
-              print("✅ WhatsApp abierto con: $urlString");
-              success = true;
-              break;
-            }
-          } catch (e) {
-            print("❌ Falló $urlString: $e");
-            continue;
-          }
-        }
-      }
-
-      if (success) {
-        // Mostrar confirmación
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('📱 WhatsApp abierto con mensaje de emergencia'),
-            backgroundColor: Colors.green,
-            duration: Duration(seconds: 3),
-          ),
-        );
-      } else {
-        print("❌ Todos los métodos de WhatsApp fallaron");
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Text('❌ WhatsApp no disponible. ¿Está instalado?'),
-            backgroundColor: Colors.red,
-            action: SnackBarAction(
-              label: 'Llamar',
-              textColor: Colors.white,
-              onPressed: () => _callEmergencyContact(cleanContact),
-            ),
-          ),
-        );
-      }
-    } catch (e) {
-      print("❌ Error enviando WhatsApp: $e");
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('❌ Error: ${e.toString()}'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    }
-  }
-
-  // Llamar a contacto de emergencia
-  void _callEmergencyContact(String phone) async {
-    try {
-      final Uri phoneUri = Uri(scheme: 'tel', path: phone);
-      if (await canLaunchUrl(phoneUri)) {
-        await launchUrl(phoneUri);
-        print("📞 Llamando a: $phone");
-      }
-    } catch (e) {
-      print('❌ Error llamando: $e');
-    }
-  }
-
-  // Iniciar countdown de emergencia (15-20 segundos)
   void _startEmergencyCountdown() {
-    if (_emergencySequenceStarted) return; // Ya está iniciado
-
+    if (_emergencySequenceStarted) return;
+    
     _emergencySequenceStarted = true;
-    print("⏰ Iniciando countdown de emergencia: 18 segundos");
-
-    // Timer de 18 segundos antes de ejecutar llamada automática
-    _emergencyTimer = Timer(const Duration(seconds: 18), () {
-      if (_emergencySequenceStarted && currentDrowsinessLevel >= 0.75) {
-        print(
-          "🚨 Ejecutando secuencia de emergencia automática tras 18s de alerta",
-        );
-        // Ejecutar WhatsApp y mostrar alerta automática
-        if (_emergencyContacts.isNotEmpty) {
-          _getRealLocation().then((_) {
-            String messageBody =
-                "🚨 ALERTA DE EMERGENCIA 🚨\n\nSe detectó cansancio extremo sostenido por 18 segundos.\n\nUbicación: $_currentLocation\n\nHora: ${DateTime.now().toString()}\n\n¡Contacta inmediatamente!";
-            _sendWhatsAppAlert(_emergencyContacts.first, messageBody);
-          });
-        }
-
-        // Llamada después de 2 segundos adicionales (total 20s)
-        Timer(const Duration(seconds: 2), () {
-          if (_emergencySequenceStarted && _emergencyContacts.isNotEmpty) {
-            _makeAutomaticEmergencyCall(_emergencyContacts.first);
-          }
-        });
+    print("⏰ Iniciando countdown de emergencia");
+    
+    // Delegar al servicio de emergencias
+    _emergencyService.startCriticalTimer((contactPhone) {
+      print("🚨 Emergencia activada - contacto: $contactPhone");
+      
+      // === TRACKING PARA FIREBASE ===
+      if (_currentTripId != null) {
+        _currentTripEmergencyCalls++;
       }
     });
+  }
+
+  // Método stub para compatibilidad con diálogos legacy
+  void _sendWhatsAppAlert(String contact, String message) {
+    print("⚠️ _sendWhatsAppAlert es un método legacy - funcionalidad movida a EmergencyService");
+    // TODO: Remover diálogos legacy y usar EmergencyService completamente
   }
 
   // Sistema de niveles de alerta
   Future<void> _checkDrowsinessLevels(double drowsinessLevel) async {
-    // Actualizar el nivel de somnolencia actual
+    // Verificar que el widget sigue montado antes de actualizar estado
+    if (!mounted) return;
+    
+    // IMPORTANTE: SOLO actualizar el nivel si el servicio está activo
+    if (!isServiceRunning) {
+      print("⚠️ Servicio no iniciado - ignorando actualización de nivel");
+      return;
+    }
+    
+    // ===== THROTTLING: Limitar tasa de procesamiento de datos =====
+    final now = DateTime.now();
+    final timeSinceLastProcess = now.difference(_lastDataProcessTime);
+    
+    if (timeSinceLastProcess < _minDataInterval) {
+      _droppedFramesCount++;
+      if (_droppedFramesCount % 10 == 0) {
+        print("⚡ Throttling activo - descartados: $_droppedFramesCount frames");
+      }
+      return; // Descartar este dato si llega muy rápido
+    }
+    
+    _lastDataProcessTime = now;
+    
+    // Agregar valor al historial para promedio móvil
+    _drowsinessHistory.add(drowsinessLevel);
+    
+    // Mantener solo los últimos N valores
+    if (_drowsinessHistory.length > _historyMaxSize) {
+      _drowsinessHistory.removeAt(0);
+    }
+    
+    // ===== LIMPIEZA DE HISTORIAL: Si hay muchos valores bajos consecutivos =====
+    // Esto ayuda a que la barra baje más rápido cuando no hay síntomas
+    if (_drowsinessHistory.length >= 10) {
+      final lastTenValues = _drowsinessHistory.sublist(_drowsinessHistory.length - 10);
+      final avgLastTen = lastTenValues.reduce((a, b) => a + b) / lastTenValues.length;
+      
+      // Si los últimos 10 valores son consistentemente bajos (<0.3), limpiar historial antiguo
+      if (avgLastTen < 0.30 && _drowsinessHistory.length > 10) {
+        // Mantener solo los últimos 10 valores
+        final recentValues = _drowsinessHistory.sublist(_drowsinessHistory.length - 10);
+        _drowsinessHistory.clear();
+        _drowsinessHistory.addAll(recentValues);
+        print("🧹 Historial limpiado - valores bajos detectados (avg: ${(avgLastTen * 100).toStringAsFixed(1)}%)");
+      }
+    }
+    
+    // Calcular promedio móvil con peso en valores recientes
+    double avgLevel;
+    if (_drowsinessHistory.length >= 5) {
+      // Promedio ponderado: 30% último, 25% penúltimo, 45% histórico
+      // Reduce impacto de picos individuales para datos ruidosos
+      double lastValue = _drowsinessHistory.last;
+      double secondLast = _drowsinessHistory[_drowsinessHistory.length - 2];
+      double restAverage = _drowsinessHistory.sublist(0, _drowsinessHistory.length - 2)
+          .reduce((a, b) => a + b) / (_drowsinessHistory.length - 2);
+      avgLevel = (lastValue * 0.30) + (secondLast * 0.25) + (restAverage * 0.45);
+    } else {
+      avgLevel = _drowsinessHistory.reduce((a, b) => a + b) / _drowsinessHistory.length;
+    }
+    
+    // ===== DECAIMIENTO GRADUAL: Si el valor es muy bajo, forzar decaimiento =====
+    // Esto asegura que la barra baje cuando no hay síntomas
+    if (avgLevel < 0.10 && currentDrowsinessLevel > 0.10) {
+      // Aplicar decaimiento más agresivo cuando no hay síntomas
+      avgLevel = currentDrowsinessLevel * 0.85; // Reducir 15% por frame
+      print("📉 Decaimiento activo: ${(currentDrowsinessLevel * 100).toStringAsFixed(1)}% → ${(avgLevel * 100).toStringAsFixed(1)}%");
+    }
+    
+    // Interpolar con velocidad limitada
+    double targetLevel = avgLevel;
+    double interpolationSpeed = 0.02; // Velocidad base (2% por frame)
+    
     setState(() {
-      currentDrowsinessLevel = drowsinessLevel;
+      // Calcular el cambio deseado
+      double difference = targetLevel - currentDrowsinessLevel;
+      
+      // Aplicar interpolación con velocidad dinámica
+      double change = difference * interpolationSpeed;
+      
+      // LIMITAR velocidad máxima de cambio para evitar saltos bruscos
+      if (change.abs() > _maxChangePerFrame) {
+        change = change.isNegative ? -_maxChangePerFrame : _maxChangePerFrame;
+      }
+      
+      // Solo actualizar si el cambio es significativo
+      if (change.abs() > 0.001) {
+        currentDrowsinessLevel = currentDrowsinessLevel + change;
+      } else {
+        currentDrowsinessLevel = targetLevel;
+      }
+      
+      // Asegurar que está en el rango válido
+      currentDrowsinessLevel = currentDrowsinessLevel.clamp(0.0, 1.0);
+      
+      // === TRACKING PARA FIREBASE ===
+      if (_currentTripId != null) {
+        _sumDrowsinessLevels += currentDrowsinessLevel;
+        _drowsinessReadingsCount++;
+        
+        if (currentDrowsinessLevel > _maxDrowsinessInTrip) {
+          _maxDrowsinessInTrip = currentDrowsinessLevel;
+        }
+        
+        // Actualizar datos del gráfico
+        final now = DateTime.now().millisecondsSinceEpoch.toDouble();
+        _drowsinessChartData.add(FlSpot(now, currentDrowsinessLevel));
+        
+        // Mantener solo últimos N puntos
+        if (_drowsinessChartData.length > _maxChartPoints) {
+          _drowsinessChartData.removeAt(0);
+        }
+      }
+      
+      // Log de debug cada 20 actualizaciones
+      if (_drowsinessHistory.length % 20 == 0) {
+        print("📊 Nivel actual: ${(currentDrowsinessLevel * 100).toStringAsFixed(1)}% | "
+              "Target: ${(targetLevel * 100).toStringAsFixed(1)}% | "
+              "Historial: ${_drowsinessHistory.length} valores");
+      }
     });
 
     // Procesar el nivel de alerta usando el nuevo sistema
-    await _handleWarningLevel(drowsinessLevel);
+    await _handleWarningLevel(currentDrowsinessLevel);
 
-    // Si el nivel es crítico, iniciar la secuencia de emergencia
-    if (drowsinessLevel >= 0.80 && !_emergencySequenceStarted) {
+    // Si el nivel es crítico (50%+), iniciar la secuencia de emergencia
+    if (currentDrowsinessLevel >= 0.80 && !_emergencySequenceStarted) {
       _startEmergencyCountdown();
     }
   }
+
+
 
   void _startWarningLevel() {
     print("⚠️ Iniciando nivel de ADVERTENCIA (amarillo/naranja)");
@@ -703,15 +1149,15 @@ class _DrivingScreenState extends State<DrivingScreen>
     _warningLevel = 1;
     _warningStartTime = DateTime.now();
 
-    // Vibración suave
-    HapticFeedback.lightImpact();
+    // Registrar alerta en historial (no crítica)
+    _tripHistoryService.recordAlert(false);
 
-    // Sonido de advertencia suave
+    // SOLO sonido, SIN vibración en advertencia
     SystemSound.play(SystemSoundType.click);
 
     // Timer de 4 segundos para pasar a crítico si persiste
     _warningTimer = Timer(const Duration(seconds: 4), () {
-      if (_isInWarningLevel && currentDrowsinessLevel >= 0.5) {
+      if (_isInWarningLevel && currentDrowsinessLevel >= 0.80) {
         _startCriticalLevel();
       }
     });
@@ -722,25 +1168,32 @@ class _DrivingScreenState extends State<DrivingScreen>
     _warningLevel = 2;
     _warningTimer?.cancel();
 
+    // Registrar alerta crítica en historial
+    _tripHistoryService.recordAlert(true);
+
     // Vibración fuerte
     HapticFeedback.heavyImpact();
 
     // Sonido más intenso
     SystemSound.play(SystemSoundType.alert);
 
-    // Timer de 5 segundos en nivel rojo antes del WhatsApp
-    _criticalTimer = Timer(const Duration(seconds: 5), () {
-      if (_warningLevel >= 2 && currentDrowsinessLevel >= 0.75) {
-        print("📱 5 segundos en nivel rojo - enviando WhatsApp");
-        _sendEmergencyWhatsApp();
-
-        // Timer adicional de 10 segundos más para la llamada (total 15s)
-        Timer(const Duration(seconds: 10), () {
-          if (_warningLevel >= 2 && currentDrowsinessLevel >= 0.75) {
-            print("📞 15 segundos total en crítico - iniciando llamada");
-            _makeEmergencyCall();
-          }
-        });
+    // Iniciar timer de emergencia (5 segundos con alarma y llamada automática)
+    _emergencyService.startCriticalTimer((String message) {
+      // Esta función se ejecuta después de 5 segundos en estado crítico
+      print("🚨 $message");
+      
+      // Registrar llamada de emergencia en historial
+      _tripHistoryService.recordEmergencyCall();
+      
+      // Mostrar mensaje al usuario
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(message),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 5),
+          ),
+        );
       }
     });
   }
@@ -756,19 +1209,22 @@ class _DrivingScreenState extends State<DrivingScreen>
     _warningTimer?.cancel();
     _criticalTimer?.cancel();
 
+    // Cancelar timer de emergencia y alarma
+    _emergencyService.cancelCriticalTimer();
+
     // También cancelar emergency si está activo
     _cancelEmergencyCountdown();
   }
 
-  // Obtener color según el nivel (40-79% amarillo/naranja, 80-100% rojo)
+  // Obtener color según el nivel con umbrales ajustados
   Color _getWarningLevelColor() {
     switch (_warningLevel) {
       case 0:
-        return Colors.green.shade600; // Normal (0-39%)
+        return Colors.green.shade600; // Normal (0-29%)
       case 1:
-        return Colors.amber.shade600; // Advertencia amarillo/naranja (40-79%)
+        return Colors.amber.shade600; // Advertencia amarillo (30-54%)
       case 2:
-        return Colors.red.shade600; // Crítico rojo (80-100%)
+        return Colors.red.shade600; // Crítico rojo (55-100%) - Ojos cerrados confirmados
       default:
         return Colors.green.shade600;
     }
@@ -776,21 +1232,47 @@ class _DrivingScreenState extends State<DrivingScreen>
 
   // Función para manejar los niveles de alerta
   Future<void> _handleWarningLevel(double drowsinessLevel) async {
+    // Verificar que el widget sigue montado
+    if (!mounted) return;
+    
+    // SOLO procesar alertas si el servicio está activo
+    if (!isServiceRunning) {
+      print("⚠️ Servicio no activo - ignorando _handleWarningLevel");
+      return;
+    }
+    
     // Determinar el nivel de alerta basado en el nivel de somnolencia
+    // 0-50%: Normal (verde)
+    // 60-70%: Advertencia (naranja) - Señales tempranas
+    // 80%+: Crítico (rojo) - Ojos cerrados confirmados
     int newWarningLevel;
-    if (drowsinessLevel >= 0.75) {
-      newWarningLevel = 2; // Nivel crítico
-    } else if (drowsinessLevel >= 0.40) {
-      newWarningLevel = 1; // Nivel de advertencia
+    if (drowsinessLevel >= 0.80) {
+      newWarningLevel = 2; // Nivel crítico - Ojos cerrados confirmados
+    } else if (drowsinessLevel >= 0.60) {
+      newWarningLevel = 1; // Nivel de advertencia - Señales tempranas
     } else {
       newWarningLevel = 0; // Normal
     }
 
     // Solo actualizar si el nivel ha cambiado
     if (_warningLevel != newWarningLevel) {
+      // Verificar mounted antes de setState
+      if (!mounted) return;
+      
       setState(() {
         _warningLevel = newWarningLevel;
       });
+
+      // === TRACKING PARA FIREBASE ===
+      if (_currentTripId != null) {
+        if (newWarningLevel == 1) {
+          _currentTripWarnings++;
+          _currentTripAlerts++;
+        } else if (newWarningLevel == 2) {
+          _currentTripCritical++;
+          _currentTripAlerts++;
+        }
+      }
 
       switch (newWarningLevel) {
         case 0: // Nivel normal
@@ -798,31 +1280,23 @@ class _DrivingScreenState extends State<DrivingScreen>
           _stopAlert();
           _emergencySequenceStarted = false;
 
-          // Solo mostrar notificación de "todo normal" si venimos de un estado de alerta
+          // NO enviar notificación interna cuando vuelve a normal
+          // Solo las críticas van a segundo plano
           if (_isInWarningLevel) {
-            await NotificationService.showEmergencyNotification(
-              title: '✅ Conducción Segura',
-              body: 'Niveles de atención normales. Buen trabajo.',
-            );
+            print("✅ Nivel normalizado - sin notificación interna");
           }
           break;
 
         case 1: // Nivel de advertencia
-          await NotificationService.showEmergencyNotification(
-            title: '⚠️ Precaución - Signos de Cansancio',
-            body:
-                'Se detectan señales tempranas de somnolencia. Mantente alerta.',
-          );
+          // NO enviar notificaciones (no funcionan)
+          print("⚠️ Nivel de advertencia activado - sin notificación");
           // Iniciar secuencia de advertencia
           _startWarningLevel();
           break;
 
         case 2: // Nivel crítico
-          await NotificationService.showEmergencyNotification(
-            title: '🚨 ¡ALERTA DE SEGURIDAD CRÍTICA!',
-            body:
-                'Nivel peligroso de somnolencia detectado. Se recomienda detenerse.',
-          );
+          // NO enviar notificaciones (no funcionan)
+          print("🚨 Nivel crítico activado - sin notificación");
           _startAlert(); // Inicia la alerta completa con sonido y vibración
 
           // Si no se ha iniciado la secuencia de emergencia, iniciarla
@@ -831,29 +1305,7 @@ class _DrivingScreenState extends State<DrivingScreen>
             _startEmergencyCountdown();
           }
 
-          // Obtener ubicación y enviar WhatsApp después de 5 segundos
-          _getRealLocation().then((_) {
-            Timer(const Duration(seconds: 5), () {
-              if (_warningLevel == 2 && _emergencyContacts.isNotEmpty) {
-                // Enviar WhatsApp
-                String messageBody =
-                    "🚨 ALERTA DE EMERGENCIA 🚨\n\n" +
-                    "Se detectó nivel crítico de somnolencia.\n\n" +
-                    "Ubicación: $_currentLocation\n\n" +
-                    "Hora: ${DateTime.now().toString()}\n\n" +
-                    "¡Por favor contacta inmediatamente!";
-
-                _sendWhatsAppAlert(_emergencyContacts.first, messageBody);
-
-                // Preparar llamada después de 3 segundos más
-                Timer(const Duration(seconds: 3), () {
-                  if (_warningLevel == 2) {
-                    _makeAutomaticEmergencyCall(_emergencyContacts.first);
-                  }
-                });
-              }
-            });
-          });
+          // Funcionalidad movida a EmergencyService
           break;
       }
 
@@ -865,50 +1317,19 @@ class _DrivingScreenState extends State<DrivingScreen>
   String _getWarningLevelMessage() {
     switch (_warningLevel) {
       case 0:
-        return "✅ Conducción Normal"; // 0-39%
+        return "✅ Conducción Normal"; // 0-29%
       case 1:
-        return "⚠️ ADVERTENCIA - Manténgase alerta"; // 40-79%
+        return "⚠️ ADVERTENCIA - Manténgase alerta"; // 30-49%
       case 2:
-        return "🚨 NIVEL CRÍTICO - Deténgase AHORA"; // 80-100%
+        return "🚨 NIVEL CRÍTICO - Deténgase AHORA"; // 50-100%
       default:
         return "✅ Conducción Normal";
     }
   }
 
-  // Enviar WhatsApp de emergencia (después de 5s en rojo)
-  void _sendEmergencyWhatsApp() async {
-    if (_emergencyContacts.isEmpty) {
-      print("❌ No hay contactos de emergencia configurados");
-      return;
-    }
+  // Método removido - ahora usa EmergencyService
 
-    print("📱 Enviando WhatsApp después de 5 segundos en nivel crítico");
-
-    // Obtener ubicación y enviar WhatsApp
-    await _getRealLocation();
-    String messageBody =
-        "🚨 ALERTA CRÍTICA DE SOMNOLENCIA 🚨\n\n"
-        "⏰ Nivel crítico sostenido por 5 segundos\n"
-        "📍 Ubicación: $_currentLocation\n"
-        "⏱️ Hora: ${DateTime.now().toString().split('.')[0]}\n\n"
-        "🚗 El conductor necesita detenerse INMEDIATAMENTE\n"
-        "📞 Si no respondes, se realizará llamada automática en 10 segundos";
-
-    _sendWhatsAppAlert(_emergencyContacts.first, messageBody);
-  }
-
-  // Realizar llamada de emergencia (después de 15s total)
-  void _makeEmergencyCall() {
-    if (_emergencyContacts.isEmpty) {
-      print("❌ No hay contactos de emergencia configurados");
-      return;
-    }
-
-    print(
-      "📞 Realizando llamada después de 15 segundos total en nivel crítico",
-    );
-    _makeAutomaticEmergencyCall(_emergencyContacts.first);
-  }
+  // Método removido - ahora usa EmergencyService
 
   // Cancelar countdown de emergencia si mejora el estado
   void _cancelEmergencyCountdown() {
@@ -1119,17 +1540,9 @@ class _DrivingScreenState extends State<DrivingScreen>
     );
   }
 
-  // Mostrar diálogo simple de emergencia (mantener para compatibilidad)
+  // Mostrar diálogo simple de emergencia
   void _showEmergencyDialog(String message) {
-    if (_emergencyContacts.isNotEmpty) {
-      _showAdvancedEmergencyDialog(
-        message,
-        _emergencyContacts.first,
-        _currentLocation,
-      );
-    } else {
-      _showSimpleEmergencyDialog(message);
-    }
+    _showSimpleEmergencyDialog(message);
   }
 
   void _showSimpleEmergencyDialog(String message) {
@@ -1309,8 +1722,6 @@ class _DrivingScreenState extends State<DrivingScreen>
 
   // Ofrecer hacer una llamada de emergencia (simplificado)
   void _offerEmergencyCall() async {
-    if (_emergencyContacts.isEmpty) return;
-
     // Mostrar el diálogo de emergencia mejorado automáticamente
     _showEmergencyDialog(
       "¡ALERTA DE CANSANCIO CRÍTICO!\n\n⚠️ Sistema de detección activado\n📍 Ubicación registrada\n⏰ ${DateTime.now().toString().split('.')[0]}\n\n🚨 Se recomienda contactar servicios de emergencia inmediatamente",
@@ -1494,31 +1905,55 @@ class _DrivingScreenState extends State<DrivingScreen>
   // --- LÓGICA DE CONTROL DE PANTALLA ---
 
   void _toggleAssistantService() {
-    // ⬇️ VALIDACIÓN: Verificar que Bluetooth esté conectado antes de iniciar
-    if (!isServiceRunning && !_bluetoothService.isConnected) {
-      // Mostrar advertencia elegante si intenta iniciar sin Bluetooth conectado
-      _showBluetoothRequiredDialog();
-      return; // ❌ No inicia el asistente
-    }
+    // ⬇️ MODO PRUEBA: Permitir iniciar con cámara local, Bluetooth opcional
+    // La cámara funciona como fuente principal de detección
 
-    // ✅ Si está conectado O si está deteniendo el servicio, continuar
+    // ✅ Continuar con inicio/detención del servicio
     setState(() {
       isServiceRunning = !isServiceRunning;
       if (isServiceRunning) {
-        currentDrowsinessLevel = 0.1;
+        currentDrowsinessLevel = 0.0;
+        _drowsinessHistory.clear(); // Limpiar historial al iniciar
 
-        // Simulación: Inicia el monitoreo de cansancio
-        _simulateDrowsinessAlert();
+        // Iniciar viaje en el historial
+        _startTrip();
 
-        // Lógica real: Iniciar la comunicación de comandos al ESP32
+        // Activar GPS automáticamente
+        _getRealLocation();
+        debugPrint('📍 GPS activado automáticamente');
+
+        // ✅ CÁMARA LOCAL ACTIVADA - Modo principal (ESP32 opcional)
+        // Usando cámara del teléfono como fuente principal de detección
+        Future.delayed(const Duration(milliseconds: 800), () {
+          if (mounted && isServiceRunning) {
+            _startCameraDetection();
+          }
+        });
+        
+        print('📹 Modo Cámara Local activado - ESP32 opcional para pruebas');
+        
+        debugPrint('📹 Modo Cámara Local activado - ESP32 opcional');
+        
+        // Simulación: Inicia el monitoreo de cansancio (comentado porque ahora usamos IA)
+        // _simulateDrowsinessAlert();
+
+        // TODO: Iniciar la comunicación de comandos al ESP32
         // _bluetoothManager.sendCommand('START_MONITORING');
         
         // Mostrar confirmación de inicio
         _showSuccessSnackBar('✅ Asistente de conducción iniciado');
       } else {
         currentDrowsinessLevel = 0.0;
+        _drowsinessHistory.clear(); // Limpiar historial al detener
         _triggerEmergencyAlert(false);
-        // Lógica real: Detener la comunicación con el ESP32
+        
+        // Finalizar viaje en el historial
+        _endTrip();
+        
+        // Detener detección con cámara
+        _stopCameraDetection();
+        
+        // TODO: Detener la comunicación con el ESP32
         // _bluetoothManager.sendCommand('STOP_MONITORING');
         
         // Mostrar confirmación de detención
@@ -1806,18 +2241,340 @@ class _DrivingScreenState extends State<DrivingScreen>
     ).push(MaterialPageRoute(builder: (context) => const SettingsScreen()));
 
     // Al regresar de SettingsScreen, recargar contactos y estado
-    await _loadEmergencyContacts();
+    // await _loadEmergencyContacts(); // Deshabilitado - usa EmergencyService
 
     if (mounted) {
       setState(() {});
     }
   }
 
+  // --- LLAMADA DE EMERGENCIA ---
+
+  Future<void> _makeEmergencyCall(String phoneNumber, String contactName) async {
+    try {
+      // Limpiar el número de teléfono
+      final String cleanPhone = phoneNumber.replaceAll(RegExp(r'[^\d+]'), '');
+      
+      // Crear URI para llamada telefónica
+      final Uri phoneUri = Uri.parse('tel:$cleanPhone');
+      
+      debugPrint('📞 Iniciando llamada de emergencia a: $contactName ($cleanPhone)');
+      
+      if (await canLaunchUrl(phoneUri)) {
+        await launchUrl(phoneUri, mode: LaunchMode.externalApplication);
+        debugPrint('✅ Llamada iniciada exitosamente');
+      } else {
+        debugPrint('❌ No se puede realizar la llamada');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('No se puede realizar la llamada a $contactName'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('❌ Error realizando llamada de emergencia: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error al intentar llamar'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  // --- MANEJO DE SONIDO CRÍTICO ---
+
+  void _startEmergencyAutoCallTimer() {
+    _emergencyCountdownSeconds = 30;
+    _emergencyAutoCallTimer?.cancel();
+    
+    _emergencyAutoCallTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      _emergencyCountdownSeconds--;
+      
+      if (_emergencyCountdownSeconds <= 0) {
+        timer.cancel();
+        // Hacer llamada automática si el usuario no ha respondido
+        _makeAutoEmergencyCall();
+      }
+      
+      // Actualizar UI del modal si está montado
+      if (mounted) {
+        setState(() {});
+      }
+    });
+    
+    debugPrint('⏰ Timer de llamada automática iniciado: 30 segundos');
+  }
+
+  void _cancelEmergencyAutoCallTimer() {
+    _emergencyAutoCallTimer?.cancel();
+    _emergencyAutoCallTimer = null;
+    debugPrint('⏹️ Timer de llamada automática CANCELADO');
+  }
+
+  Future<void> _makeAutoEmergencyCall() async {
+    // Detener sonido
+    await _criticalAudioPlayer.stop();
+    _isCriticalSoundPlaying = false;
+    _criticalSoundManuallyStopped = true;
+    
+    // Cerrar modal
+    if (mounted) {
+      try {
+        Navigator.of(context, rootNavigator: true).pop();
+      } catch (e) {
+        // Modal ya estaba cerrado
+      }
+    }
+    
+    // Hacer llamada de emergencia
+    final contact = await _emergencyService.getEmergencyContact();
+    if (contact != null) {
+      _makeEmergencyCall(contact.phone, contact.name);
+      debugPrint('📞 LLAMADA AUTOMÁTICA DE EMERGENCIA - Usuario no respondió');
+    } else {
+      debugPrint('⚠️ No se pudo hacer llamada automática: sin contacto configurado');
+    }
+  }
+
+  Future<void> _handleCriticalSound(double drowsinessLevel) async {
+    try {
+      // Si el nivel de somnolencia es >= 70%, no está sonando y no fue pausado manualmente
+      if (drowsinessLevel >= 0.70 && !_isCriticalSoundPlaying && !_criticalSoundManuallyStopped) {
+        try {
+          await _criticalAudioPlayer.setLoopMode(LoopMode.one);
+          await _criticalAudioPlayer.setAsset('assets/sounds/ambulance.mp3');
+          await _criticalAudioPlayer.play();
+          _isCriticalSoundPlaying = true;
+          debugPrint('🚨 Sonido crítico ACTIVADO - Nivel: ${(drowsinessLevel * 100).toStringAsFixed(1)}%');
+          
+          // Iniciar countdown para llamada automática (30 segundos)
+          _startEmergencyAutoCallTimer();
+          
+          // Mostrar modal de alerta crítica
+          if (mounted) {
+            _showCriticalAlertDialog();
+          }
+        } catch (assetError) {
+          debugPrint('⚠️ No se pudo cargar ambulance.mp3. Agrega el archivo en assets/sounds/');
+          debugPrint('   Ver instrucciones en: assets/sounds/INSTRUCCIONES.md');
+          // No marcar como playing si el archivo no existe
+        }
+      }
+      // Si el nivel bajó a verde (<15%, estado alerta) y el sonido está sonando
+      else if (drowsinessLevel < 0.15 && _isCriticalSoundPlaying) {
+        await _criticalAudioPlayer.stop();
+        _isCriticalSoundPlaying = false;
+        _criticalSoundManuallyStopped = false; // Resetear para permitir futuras alertas
+        _cancelEmergencyAutoCallTimer(); // Cancelar timer de llamada automática
+        debugPrint('✅ Sonido crítico DETENIDO automáticamente - Nivel VERDE: ${(drowsinessLevel * 100).toStringAsFixed(1)}%');
+        
+        // Cerrar el modal si está abierto
+        if (mounted) {
+          try {
+            Navigator.of(context, rootNavigator: true).pop();
+          } catch (e) {
+            // Modal ya estaba cerrado
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('❌ Error manejando sonido crítico: $e');
+      _isCriticalSoundPlaying = false;
+    }
+  }
+
+  void _showCriticalAlertDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return Dialog(
+          backgroundColor: Colors.transparent,
+          child: Container(
+            padding: EdgeInsets.all(24),
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [Colors.red.shade900, Colors.red.shade700],
+              ),
+              borderRadius: BorderRadius.circular(30),
+              border: Border.all(color: Colors.white, width: 3),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.red.withOpacity(0.5),
+                  blurRadius: 30,
+                  spreadRadius: 10,
+                ),
+              ],
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Icono animado
+                Container(
+                  padding: EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    shape: BoxShape.circle,
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.white.withOpacity(0.3),
+                        blurRadius: 20,
+                        spreadRadius: 5,
+                      ),
+                    ],
+                  ),
+                  child: Icon(
+                    Icons.warning_amber_rounded,
+                    color: Colors.red.shade900,
+                    size: 60,
+                  ),
+                ),
+                SizedBox(height: 24),
+                // Título
+                Text(
+                  'ALERTA CRÍTICA',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 28,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 2,
+                  ),
+                ),
+                SizedBox(height: 16),
+                // Mensaje
+                Text(
+                  '¡NIVEL DE SOMNOLENCIA PELIGROSO!',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+                SizedBox(height: 12),
+                Container(
+                  padding: EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(15),
+                  ),
+                  child: Column(
+                    children: [
+                      Text(
+                        'Se recomienda DETENER el vehículo de inmediato y descansar',
+                        style: TextStyle(
+                          color: Colors.white70,
+                          fontSize: 15,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                      SizedBox(height: 8),
+                      Text(
+                        'Llamada automática en: $_emergencyCountdownSeconds seg',
+                        style: TextStyle(
+                          color: Colors.yellowAccent,
+                          fontSize: 14,
+                          fontWeight: FontWeight.bold,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                  ),
+                ),
+                SizedBox(height: 24),
+                // Botones de acción
+                Row(
+                  children: [
+                    // Botón de Llamada de Emergencia
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: () async {
+                          _cancelEmergencyAutoCallTimer(); // Cancelar timer
+                          await _criticalAudioPlayer.stop();
+                          _isCriticalSoundPlaying = false;
+                          _criticalSoundManuallyStopped = true;
+                          Navigator.of(context).pop();
+                          // Llamar emergencia
+                          final contact = await _emergencyService.getEmergencyContact();
+                          if (contact != null) {
+                            _makeEmergencyCall(contact.phone, contact.name);
+                          }
+                          debugPrint('📞 Llamada de emergencia iniciada MANUALMENTE');
+                        },
+                        icon: Icon(Icons.phone, size: 24),
+                        label: Text(
+                          'LLAMAR',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white,
+                          foregroundColor: Colors.red.shade900,
+                          padding: EdgeInsets.symmetric(vertical: 16),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(15),
+                          ),
+                        ),
+                      ),
+                    ),
+                    SizedBox(width: 12),
+                    // Botón de Pausar
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: () async {
+                          _cancelEmergencyAutoCallTimer(); // Cancelar timer
+                          await _criticalAudioPlayer.stop();
+                          _isCriticalSoundPlaying = false;
+                          _criticalSoundManuallyStopped = true;
+                          Navigator.of(context).pop();
+                          debugPrint('⏸️ Usuario PAUSÓ el sonido crítico');
+                        },
+                        icon: Icon(Icons.volume_off_rounded, size: 24),
+                        label: Text(
+                          'PAUSAR',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.white,
+                          side: BorderSide(color: Colors.white, width: 2),
+                          padding: EdgeInsets.symmetric(vertical: 16),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(15),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   // --- WIDGETS DE CONSTRUCCIÓN ---
 
   @override
   Widget build(BuildContext context) {
-    // Configurar el fondo según el nivel de alerta (40-79% amarillo/naranja, 80-100% rojo)
+    // Configurar el fondo según el nivel de alerta
+    // 0-59%: Fondo azul oscuro (normal)
+    // 60-79%: Fondo naranja (advertencia)
+    // 80%+: Fondo rojo (crítico)
     Color backgroundColor;
     switch (_warningLevel) {
       case 0:
@@ -1826,7 +2583,7 @@ class _DrivingScreenState extends State<DrivingScreen>
           8,
           8,
           20,
-        ); // Azul muy oscuro / casi negro (normal 0-39%)
+        ); // Azul muy oscuro / casi negro (normal 0-59%)
         break;
       case 1:
         backgroundColor = const Color.fromARGB(
@@ -1834,7 +2591,7 @@ class _DrivingScreenState extends State<DrivingScreen>
           60,
           35,
           0,
-        ); // Naranja más visible (advertencia 40-79%)
+        ); // Naranja más visible (advertencia 60-79%)
         break;
       case 2:
         backgroundColor = const Color.fromARGB(
@@ -1842,22 +2599,26 @@ class _DrivingScreenState extends State<DrivingScreen>
           80,
           0,
           0,
-        ); // Rojo muy oscuro (crítico 80-100%)
+        ); // Rojo muy oscuro (crítico 80%+)
         break;
       default:
         backgroundColor = const Color.fromARGB(255, 8, 8, 20);
     }
 
-    // Procesar niveles de somnolencia
-    if (_bluetoothService.isConnected) {
-      _checkDrowsinessLevels(currentDrowsinessLevel);
-    }
+    // Procesar niveles de somnolencia (con o sin Bluetooth)
+    // La cámara local es la fuente principal, ESP32 es opcional
+    _checkDrowsinessLevels(currentDrowsinessLevel);
 
     String mainStatusMessage;
-    if (_bluetoothService.isConnected) {
+    if (isServiceRunning) {
       mainStatusMessage = _getWarningLevelMessage();
     } else {
-      mainStatusMessage = '📱 CONECTANDO...';
+      // Mostrar estado de Bluetooth si está conectado
+      if (_bluetoothService.isConnected) {
+        mainStatusMessage = '📱 ESP32 CONECTADO';
+      } else {
+        mainStatusMessage = '📹 CÁMARA LOCAL LISTA';
+      }
     }
 
     return Scaffold(
@@ -1866,6 +2627,32 @@ class _DrivingScreenState extends State<DrivingScreen>
         backgroundColor: backgroundColor,
         elevation: 0,
         automaticallyImplyLeading: false,
+        title: FutureBuilder<String>(
+          future: _getUserName(),
+          builder: (context, snapshot) {
+            final userName = snapshot.data ?? 'Usuario';
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'EyeScanDrive',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                Text(
+                  'Bienvenido, $userName',
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 14,
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
         actions: [
           // Botón de configuración mejorado
           Container(
@@ -1903,22 +2690,31 @@ class _DrivingScreenState extends State<DrivingScreen>
             children: [
               // --- TARJETA DE ESTADO BLUETOOTH ---
               _buildBluetoothCard(),
-              const SizedBox(height: 20),
+              const SizedBox(height: 15),
+
+              // --- MINI PREVIEW DE CÁMARA REMOVIDO ---
+              // Se movió solo el indicador de estado
 
               // --- INDICADOR VISUAL PRINCIPAL ---
               Expanded(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    // Círculo principal de estado
+                    // Círculo principal de estado con cámara
                     AnimatedBuilder(
                       animation: _pulseController,
                       builder: (context, child) {
-                        Color statusColor = _bluetoothService.isConnected
-                            ? (currentDrowsinessLevel >= 0.75
-                                  ? Colors.red
-                                  : Colors.green)
-                            : Colors.grey;
+                        // Color según nivel de somnolencia
+                        Color statusColor;
+                        if (currentDrowsinessLevel >= 0.70) {
+                          statusColor = Colors.red; // Peligro
+                        } else if (currentDrowsinessLevel >= 0.45) {
+                          statusColor = Colors.deepOrange; // Somnoliento
+                        } else if (currentDrowsinessLevel >= 0.20) {
+                          statusColor = Colors.orange; // Cansado
+                        } else {
+                          statusColor = Colors.green; // Alerta
+                        }
 
                         return Transform.scale(
                           scale: 1.0 + (_pulseAnimation.value * 0.1),
@@ -1927,11 +2723,9 @@ class _DrivingScreenState extends State<DrivingScreen>
                             width: 150,
                             decoration: BoxDecoration(
                               shape: BoxShape.circle,
-                              gradient: RadialGradient(
-                                colors: [
-                                  statusColor.withOpacity(0.8),
-                                  statusColor.withOpacity(0.4),
-                                ],
+                              border: Border.all(
+                                color: statusColor,
+                                width: 3,
                               ),
                               boxShadow: [
                                 BoxShadow(
@@ -1941,12 +2735,21 @@ class _DrivingScreenState extends State<DrivingScreen>
                                 ),
                               ],
                             ),
-                            child: Icon(
-                              _bluetoothService.isConnected
-                                  ? Icons.visibility_rounded
-                                  : Icons.bluetooth_disabled_rounded,
-                              color: Colors.white,
-                              size: 50,
+                            child: ClipOval(
+                              child: isServiceRunning && _cameraController != null && _cameraController!.value.isInitialized
+                                  ? CameraPreview(_cameraController!)
+                                  : Container(
+                                      color: Colors.black87,
+                                      child: Icon(
+                                        isServiceRunning
+                                            ? Icons.camera_alt_rounded
+                                            : (_bluetoothService.isConnected
+                                                ? Icons.bluetooth_connected_rounded
+                                                : Icons.camera_alt_rounded),
+                                        color: Colors.white,
+                                        size: 50,
+                                      ),
+                                    ),
                             ),
                           ),
                         );
@@ -1959,7 +2762,7 @@ class _DrivingScreenState extends State<DrivingScreen>
                       mainStatusMessage,
                       textAlign: TextAlign.center,
                       style: TextStyle(
-                        fontSize: currentDrowsinessLevel >= 0.75 ? 28 : 22,
+                        fontSize: currentDrowsinessLevel >= 0.80 ? 28 : 22,
                         fontWeight: FontWeight.bold,
                         color: Colors.white,
                       ),
@@ -2052,6 +2855,190 @@ class _DrivingScreenState extends State<DrivingScreen>
   }
 
   // --- MÉTODOS DE CONSTRUCCIÓN DE UI ---
+
+  Future<String> _getUserName() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString('user_name') ?? 'Usuario';
+  }
+
+  // Mini preview de cámara con umbrales de detección
+  Widget _buildCameraPreviewWithThresholds() {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: Colors.white.withOpacity(0.2),
+          width: 1,
+        ),
+      ),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(6),
+                decoration: BoxDecoration(
+                  color: Colors.blue.withOpacity(0.3),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Icon(Icons.camera_alt, color: Colors.blue, size: 18),
+              ),
+              const SizedBox(width: 10),
+              const Text(
+                'Detección en Vivo',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const Spacer(),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.green.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: Colors.green, width: 1),
+                ),
+                child: const Text(
+                  '• ACTIVO',
+                  style: TextStyle(
+                    color: Colors.green,
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          // Mini preview de la cámara
+          Container(
+            height: 120,
+            decoration: BoxDecoration(
+              color: Colors.black87,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.white24, width: 1),
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: _cameraController != null && _cameraController!.value.isInitialized
+                  ? CameraPreview(_cameraController!)
+                  : const Center(
+                      child: CircularProgressIndicator(color: Colors.white),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          // Indicadores de umbrales
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceAround,
+            children: [
+              _buildThresholdIndicator(
+                'Alerta', 
+                currentDrowsinessLevel < 0.20, 
+                Colors.green,
+                '< 20%',
+              ),
+              _buildThresholdIndicator(
+                'Cansado', 
+                currentDrowsinessLevel >= 0.20 && currentDrowsinessLevel < 0.45, 
+                Colors.orange,
+                '20-45%',
+              ),
+              _buildThresholdIndicator(
+                'Somnoliento', 
+                currentDrowsinessLevel >= 0.45 && currentDrowsinessLevel < 0.70, 
+                Colors.deepOrange,
+                '45-70%',
+              ),
+              _buildThresholdIndicator(
+                'Peligro', 
+                currentDrowsinessLevel >= 0.70, 
+                Colors.red,
+                '> 70%',
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          // Nivel actual
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(
+                  'Nivel actual: ',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 11,
+                  ),
+                ),
+                Text(
+                  '${(currentDrowsinessLevel * 100).toStringAsFixed(1)}%',
+                  style: TextStyle(
+                    color: currentDrowsinessLevel >= 0.70
+                        ? Colors.red
+                        : currentDrowsinessLevel >= 0.45
+                            ? Colors.orange
+                            : Colors.green,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildThresholdIndicator(String label, bool isActive, Color color, String range) {
+    return Column(
+      children: [
+        Container(
+          width: 10,
+          height: 10,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: isActive ? color : Colors.grey.withOpacity(0.3),
+            boxShadow: isActive
+                ? [
+                    BoxShadow(
+                      color: color.withOpacity(0.5),
+                      blurRadius: 8,
+                      spreadRadius: 2,
+                    ),
+                  ]
+                : [],
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          style: TextStyle(
+            color: isActive ? color : Colors.white30,
+            fontSize: 9,
+            fontWeight: isActive ? FontWeight.bold : FontWeight.normal,
+          ),
+        ),
+        Text(
+          range,
+          style: const TextStyle(
+            color: Colors.white30,
+            fontSize: 8,
+          ),
+        ),
+      ],
+    );
+  }
 
   // Tarjeta de estado Bluetooth prominente
   Widget _buildBluetoothCard() {
@@ -2165,30 +3152,96 @@ class _DrivingScreenState extends State<DrivingScreen>
   // Fila de botones de acción
   Widget _buildActionButtonsRow() {
     return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        // Botón de Contactos de Emergencia
-        Expanded(
-          child: _buildActionCard(
-            icon: Icons.emergency_rounded,
-            title: 'Contactos',
-            subtitle: '${_emergencyContacts.length} configurados',
-            color: _emergencyContacts.isEmpty ? Colors.red : Colors.green,
-            onTap: _showEmergencyContactsModal,
-          ),
+        // Botón de Contactos de Emergencia - Solo icono
+        FutureBuilder<EmergencyContact?>(
+          future: _emergencyService.getEmergencyContact(),
+          builder: (context, snapshot) {
+            final hasContact = snapshot.hasData && snapshot.data != null;
+            return _buildModernIconButton(
+              icon: Icons.contacts_rounded,
+              isActive: hasContact,
+              activeColor: Colors.greenAccent,
+              inactiveColor: Colors.redAccent,
+              onTap: _showEmergencyContactsModal,
+            );
+          },
         ),
-        const SizedBox(width: 15),
+        const SizedBox(width: 30),
 
-        // Botón de Ubicación/GPS
-        Expanded(
-          child: _buildActionCard(
-            icon: Icons.location_on_rounded,
-            title: 'Ubicación',
-            subtitle: 'GPS activo',
-            color: Colors.blue,
-            onTap: _getRealLocation,
-          ),
+        // Botón de Ubicación/GPS - Solo icono
+        _buildModernIconButton(
+          icon: Icons.gps_fixed_rounded,
+          isActive: true, // GPS siempre activo mientras conduce
+          activeColor: Colors.blueAccent,
+          inactiveColor: Colors.grey,
+          onTap: _getRealLocation,
         ),
       ],
+    );
+  }
+
+  // Botón moderno solo con icono e indicador de estado
+  Widget _buildModernIconButton({
+    required IconData icon,
+    required bool isActive,
+    required Color activeColor,
+    required Color inactiveColor,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          Container(
+            width: 70,
+            height: 70,
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.1),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(
+                color: (isActive ? activeColor : inactiveColor).withOpacity(0.3),
+                width: 2,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: (isActive ? activeColor : inactiveColor).withOpacity(0.2),
+                  blurRadius: 10,
+                  spreadRadius: 2,
+                ),
+              ],
+            ),
+            child: Icon(
+              icon,
+              color: isActive ? activeColor : inactiveColor,
+              size: 32,
+            ),
+          ),
+          // Indicador de estado (círculo)
+          Positioned(
+            top: -4,
+            right: -4,
+            child: Container(
+              width: 16,
+              height: 16,
+              decoration: BoxDecoration(
+                color: isActive ? Colors.greenAccent : Colors.redAccent,
+                shape: BoxShape.circle,
+                border: Border.all(color: Colors.white, width: 2),
+                boxShadow: [
+                  BoxShadow(
+                    color: (isActive ? Colors.greenAccent : Colors.redAccent).withOpacity(0.5),
+                    blurRadius: 6,
+                    spreadRadius: 1,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -2392,23 +3445,96 @@ class _DrivingScreenState extends State<DrivingScreen>
         await dataCharacteristic.setNotifyValue(true);
         print("✓ Notificaciones BLE configuradas correctamente");
 
+        // Cancelar suscripción anterior si existe
+        await _bleDataSubscription?.cancel();
+        
         // Configurar el listener para procesar los datos recibidos
-        dataCharacteristic.onValueReceived.listen((value) async {
+        _bleDataSubscription = dataCharacteristic.onValueReceived.listen((value) async {
+          // IMPORTANTE: Verificar que el widget sigue en el árbol antes de procesar
+          if (!mounted) {
+            print("⚠️ Widget disposed, ignorando datos BLE");
+            return;
+          }
+          
           if (value.isNotEmpty) {
             String data = String.fromCharCodes(value);
+            print("📥 Datos recibidos: $data");
+            
             try {
-              // Asumiendo que el dato viene como un número entre 0 y 1
-              double drowsinessLevel = double.parse(data);
-              if (drowsinessLevel >= 0 && drowsinessLevel <= 1) {
-                await _checkDrowsinessLevels(drowsinessLevel);
+              // Parsear JSON del ESP32: {"drowsiness":0.45,"timestamp":733575}
+              final jsonData = json.decode(data);
+              
+              if (jsonData is Map && jsonData.containsKey('drowsiness')) {
+                double drowsinessLevel = jsonData['drowsiness'].toDouble();
+                
+                if (drowsinessLevel >= 0 && drowsinessLevel <= 1) {
+                  // SOLO procesar si el servicio está activo (usuario presionó INICIAR)
+                  if (mounted && isServiceRunning) {
+                    await _checkDrowsinessLevels(drowsinessLevel);
+                  } else if (!isServiceRunning) {
+                    // Mantener el nivel en 0 si no está activo
+                    if (mounted && currentDrowsinessLevel != 0.0) {
+                      setState(() {
+                        currentDrowsinessLevel = 0.0;
+                      });
+                    }
+                    print("⚠️ Servicio no iniciado - nivel forzado a 0%");
+                  }
+                }
               }
             } catch (e) {
-              print("Error procesando datos recibidos: $e");
+              print("⚠️ Error procesando datos: $e");
+              print("   Datos recibidos: $data");
             }
           }
         });
       } catch (e) {
         print("⚠️ No se pudieron configurar notificaciones (sin CCCD): $e");
+      }
+
+      // ========================================
+      // CONFIGURAR SUSCRIPCIÓN A VIDEO STREAM
+      // ========================================
+      try {
+        // Buscar la característica de video (UUID: 0000ffe2-...)
+        BluetoothCharacteristic? videoCharacteristic;
+        
+        print("🔍 Buscando característica de video (ffe2)...");
+        
+        for (BluetoothService service in services) {
+          // Verificar si es el servicio correcto (ffe0)
+          if (service.uuid.str.toUpperCase().contains("FFE0")) {
+            print("   ✅ Servicio FFE0 encontrado, buscando FFE2...");
+            
+            for (BluetoothCharacteristic char in service.characteristics) {
+              String charUuid = char.uuid.str.toUpperCase();
+              print("   Revisando característica: $charUuid");
+              
+              // Comparar con UUID completo (0000ffe2-0000-1000-8000-00805f9b34fb)
+              if (charUuid == "0000FFE2-0000-1000-8000-00805F9B34FB") {
+                videoCharacteristic = char;
+                print("   ✅ ¡Característica de video FFE2 ENCONTRADA!");
+                break;
+              }
+            }
+          }
+          if (videoCharacteristic != null) break;
+        }
+        
+        if (videoCharacteristic != null) {
+          await videoCharacteristic.setNotifyValue(true);
+          print("✅ Notificaciones de VIDEO BLE configuradas correctamente");
+          
+          // Cancelar suscripción anterior si existe
+          await _bleVideoSubscription?.cancel();
+          
+          // Funcionalidad de video ESP32 removida
+        } else {
+          print("❌ ERROR: Característica de video FFE2 NO ENCONTRADA");
+          print("   Verifica que el ESP32 esté anunciando FFE2 correctamente");
+        }
+      } catch (e) {
+        print("⚠️ No se pudo configurar stream de video: $e");
       }
 
       // Configurar listener de desconexión
@@ -2660,25 +3786,13 @@ class _DrivingScreenState extends State<DrivingScreen>
 
                 const SizedBox(height: 15),
 
-                // Botón agregar
+                // Botón agregar (deshabilitado - usa EmergencyContactScreen)
                 SizedBox(
                   width: double.infinity,
                   child: ElevatedButton.icon(
-                    onPressed: () async {
-                      if (nameController.text.trim().isNotEmpty &&
-                          phoneController.text.trim().isNotEmpty) {
-                        await _addEmergencyContact(
-                          nameController.text.trim(),
-                          phoneController.text.trim(),
-                        );
-                        nameController.clear();
-                        phoneController.clear();
-                        setModalState(() {});
-                        setState(() {});
-                      }
-                    },
+                    onPressed: null, // Deshabilitado
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.green,
+                      backgroundColor: Colors.grey,
                       foregroundColor: Colors.white,
                       padding: const EdgeInsets.symmetric(vertical: 12),
                       shape: RoundedRectangleBorder(
@@ -2695,94 +3809,36 @@ class _DrivingScreenState extends State<DrivingScreen>
 
           const SizedBox(height: 20),
 
-          // Lista de contactos existentes
+          // Mensaje para usar la nueva pantalla
           Expanded(
-            child: _emergencyContacts.isEmpty
-                ? Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(
-                          Icons.contact_phone_outlined,
-                          size: 64,
-                          color: Colors.grey.shade600,
-                        ),
-                        const SizedBox(height: 20),
-                        Text(
-                          'No hay contactos configurados',
-                          style: TextStyle(
-                            color: Colors.grey.shade400,
-                            fontSize: 18,
-                          ),
-                        ),
-                        const SizedBox(height: 10),
-                        Text(
-                          'Agrega contactos para emergencias',
-                          style: TextStyle(
-                            color: Colors.grey.shade500,
-                            fontSize: 14,
-                          ),
-                        ),
-                      ],
-                    ),
-                  )
-                : ListView.builder(
-                    padding: const EdgeInsets.symmetric(horizontal: 20),
-                    itemCount: _emergencyContacts.length,
-                    itemBuilder: (context, index) {
-                      final contact = _emergencyContacts[index];
-
-                      return Container(
-                        margin: const EdgeInsets.only(bottom: 10),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.05),
-                          borderRadius: BorderRadius.circular(15),
-                          border: Border.all(
-                            color: Colors.white.withOpacity(0.1),
-                          ),
-                        ),
-                        child: ListTile(
-                          leading: Container(
-                            padding: const EdgeInsets.all(8),
-                            decoration: BoxDecoration(
-                              color: Colors.red.withOpacity(0.2),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: const Icon(
-                              Icons.emergency,
-                              color: Colors.red,
-                              size: 20,
-                            ),
-                          ),
-                          title: Text(
-                            'Contacto ${index + 1}',
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          subtitle: Text(
-                            contact,
-                            style: TextStyle(
-                              color: Colors.grey.shade400,
-                              fontSize: 14,
-                            ),
-                          ),
-                          trailing: IconButton(
-                            onPressed: () async {
-                              await _removeEmergencyContact(index);
-                              setModalState(() {});
-                              setState(() {});
-                            },
-                            icon: const Icon(
-                              Icons.delete_rounded,
-                              color: Colors.red,
-                            ),
-                          ),
-                        ),
-                      );
-                    },
+            child: Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    Icons.contact_emergency,
+                    size: 64,
+                    color: Colors.blue.shade400,
                   ),
+                  const SizedBox(height: 20),
+                  Text(
+                    'Gestiona tus contactos de emergencia',
+                    style: TextStyle(
+                      color: Colors.grey.shade300,
+                      fontSize: 18,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    'Usa el botón rojo del menú superior',
+                    style: TextStyle(
+                      color: Colors.grey.shade500,
+                      fontSize: 14,
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
 
           // Botón cerrar
@@ -2809,49 +3865,7 @@ class _DrivingScreenState extends State<DrivingScreen>
     );
   }
 
-  Future<void> _addEmergencyContact(String name, String phone) async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final contacts = prefs.getStringList('emergency_contacts') ?? [];
-
-      // Agregar nuevo contacto en formato "Nombre|Teléfono"
-      contacts.add('$name|$phone');
-
-      await prefs.setStringList('emergency_contacts', contacts);
-      await _loadEmergencyContacts(); // Recargar la lista
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('✅ Contacto $name agregado'),
-          backgroundColor: Colors.green,
-        ),
-      );
-    } catch (e) {
-      print('Error agregando contacto: $e');
-    }
-  }
-
-  Future<void> _removeEmergencyContact(int index) async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final contacts = prefs.getStringList('emergency_contacts') ?? [];
-
-      if (index < contacts.length) {
-        contacts.removeAt(index);
-        await prefs.setStringList('emergency_contacts', contacts);
-        await _loadEmergencyContacts(); // Recargar la lista
-
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('🗑️ Contacto eliminado'),
-            backgroundColor: Colors.orange,
-          ),
-        );
-      }
-    } catch (e) {
-      print('Error eliminando contacto: $e');
-    }
-  }
+  // Métodos removidos - ahora usa EmergencyService y EmergencyContactScreen
 
   Widget _buildBluetoothModalContent(StateSetter setModalState) {
     return Container(
@@ -3255,7 +4269,7 @@ class _DrivingScreenState extends State<DrivingScreen>
           animation: _alertAnimation,
           builder: (context, child) {
             return Transform.scale(
-              scale: currentDrowsinessLevel >= 0.75
+              scale: currentDrowsinessLevel >= 0.80
                   ? _alertAnimation.value
                   : _pulseAnimation.value,
               child: Container(
@@ -3344,11 +4358,23 @@ class _DrivingScreenState extends State<DrivingScreen>
                               letterSpacing: 2,
                             ),
                           ),
+                          const SizedBox(height: 8),
+                          // Porcentaje de somnolencia
                           Text(
                             '${(currentDrowsinessLevel * 100).toInt()}%',
                             style: TextStyle(
-                              color: Colors.white.withOpacity(0.8),
-                              fontSize: 16,
+                              color: Colors.white,
+                              fontSize: 32,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 1,
+                              shadows: [
+                                Shadow(
+                                  color: currentDrowsinessLevel >= 0.75
+                                      ? Colors.red
+                                      : Colors.cyan,
+                                  blurRadius: 15,
+                                ),
+                              ],
                             ),
                           ),
                         ],
@@ -3386,10 +4412,10 @@ class _DrivingScreenState extends State<DrivingScreen>
           _buildInfoRow(
             Icons.psychology_rounded,
             'Estado del Conductor',
-            currentDrowsinessLevel >= 0.75
+            currentDrowsinessLevel >= 0.50
                 ? 'CANSANCIO CRÍTICO'
                 : 'ALERTA Y ACTIVO',
-            currentDrowsinessLevel >= 0.75 ? Colors.red : Colors.green,
+            currentDrowsinessLevel >= 0.50 ? Colors.red : Colors.green,
           ),
           const Divider(color: Colors.white24, height: 30),
 
@@ -3405,13 +4431,17 @@ class _DrivingScreenState extends State<DrivingScreen>
           const Divider(color: Colors.white24, height: 30),
 
           // Contactos de emergencia
-          _buildInfoRow(
-            Icons.contacts_rounded,
-            'Contactos de Emergencia',
-            _emergencyContacts.isEmpty
-                ? 'No configurados'
-                : '${_emergencyContacts.length} contacto(s)',
-            _emergencyContacts.isEmpty ? Colors.orange : Colors.green,
+          FutureBuilder<EmergencyContact?>(
+            future: _emergencyService.getEmergencyContact(),
+            builder: (context, snapshot) {
+              final hasContact = snapshot.hasData && snapshot.data != null;
+              return _buildInfoRow(
+                Icons.contacts_rounded,
+                'Contactos de Emergencia',
+                hasContact ? 'Configurado' : 'No configurado',
+                hasContact ? Colors.green : Colors.orange,
+              );
+            },
           ),
         ],
       ),
@@ -3575,14 +4605,14 @@ class _DrivingScreenState extends State<DrivingScreen>
 
   Widget _buildStatusIndicator() {
     Color statusColor = _bluetoothService.isConnected
-        ? (currentDrowsinessLevel >= 0.75 ? Colors.red : Colors.green)
+        ? (currentDrowsinessLevel >= 0.80 ? Colors.red : Colors.green)
         : Colors.grey;
 
     String mainStatusMessage;
     String detailStatusMessage;
 
     if (_bluetoothService.isConnected) {
-      if (currentDrowsinessLevel >= 0.75) {
+      if (currentDrowsinessLevel >= 0.80) {
         mainStatusMessage = '⚠️ CANSANCIO DETECTADO ⚠️';
         detailStatusMessage = 'Sistema activo - ¡Detente y descansa!';
       } else {
@@ -3639,7 +4669,7 @@ class _DrivingScreenState extends State<DrivingScreen>
           mainStatusMessage,
           textAlign: TextAlign.center,
           style: TextStyle(
-            fontSize: currentDrowsinessLevel >= 0.75 ? 32 : 24,
+            fontSize: currentDrowsinessLevel >= 0.80 ? 32 : 24,
             fontWeight: FontWeight.bold,
             color: Colors.white,
           ),
@@ -3721,14 +4751,20 @@ class _DrivingScreenState extends State<DrivingScreen>
               const SizedBox(width: 16),
 
               // Indicador de Contactos de Emergencia
-              Icon(
-                _emergencyContacts.isEmpty
-                    ? Icons.contact_emergency_outlined
-                    : Icons.contact_emergency,
-                color: _emergencyContacts.isEmpty
-                    ? Colors.red.shade400
-                    : Colors.green.shade400,
-                size: 28,
+              FutureBuilder<EmergencyContact?>(
+                future: _emergencyService.getEmergencyContact(),
+                builder: (context, snapshot) {
+                  final hasContact = snapshot.hasData && snapshot.data != null;
+                  return Icon(
+                    hasContact
+                        ? Icons.contact_emergency
+                        : Icons.contact_emergency_outlined,
+                    color: hasContact
+                        ? Colors.green.shade400
+                        : Colors.red.shade400,
+                    size: 28,
+                  );
+                },
               ),
             ],
           ),
@@ -3746,46 +4782,209 @@ class _DrivingScreenState extends State<DrivingScreen>
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                "Nivel de Cansancio:",
-                style: TextStyle(color: Colors.white70, fontSize: 16),
-              ),
-              const SizedBox(height: 8),
-
-              AnimatedContainer(
-                duration: const Duration(milliseconds: 500),
-                curve: Curves.easeInOut,
-                child: LinearProgressIndicator(
-                  value: currentDrowsinessLevel * _statusAnimation.value,
-                  minHeight: 15,
-                  borderRadius: BorderRadius.circular(8),
-                  backgroundColor: Colors.grey.shade700,
-                  valueColor: AlwaysStoppedAnimation<Color>(statusColor),
-                ),
-              ),
-
-              const SizedBox(height: 5),
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   const Text(
-                    "Seguro",
-                    style: TextStyle(color: Colors.greenAccent),
+                    "Nivel de Cansancio",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.5,
+                    ),
                   ),
-                  AnimatedOpacity(
-                    opacity: currentDrowsinessLevel >= 0.75 ? 1.0 : 0.7,
-                    duration: const Duration(milliseconds: 300),
+                  // Porcentaje grande y visible
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: currentDrowsinessLevel >= 0.50
+                            ? [Colors.red.shade600, Colors.red.shade800]
+                            : currentDrowsinessLevel >= 0.30
+                                ? [Colors.orange.shade600, Colors.orange.shade800]
+                                : [Colors.green.shade600, Colors.green.shade800],
+                      ),
+                      borderRadius: BorderRadius.circular(12),
+                      boxShadow: [
+                        BoxShadow(
+                          color: (currentDrowsinessLevel >= 0.50
+                                  ? Colors.red
+                                  : currentDrowsinessLevel >= 0.30
+                                      ? Colors.orange
+                                      : Colors.green)
+                              .withOpacity(0.5),
+                          blurRadius: 15,
+                          spreadRadius: 2,
+                        ),
+                      ],
+                    ),
                     child: Text(
-                      "¡Alerta! (${(currentDrowsinessLevel * 100).toInt()}%)",
-                      style: TextStyle(
+                      '${(currentDrowsinessLevel * 100).toInt()}%',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 24,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 1,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+
+              // Barra de progreso mejorada con gradiente
+              AnimatedContainer(
+                duration: const Duration(milliseconds: 500),
+                curve: Curves.easeInOut,
+                height: 24,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.4),
+                      blurRadius: 8,
+                      offset: const Offset(0, 3),
+                    ),
+                  ],
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: Stack(
+                    children: [
+                      // Fondo de la barra
+                      Container(
+                        decoration: BoxDecoration(
+                          color: Colors.grey.shade900,
+                          border: Border.all(
+                            color: Colors.white.withOpacity(0.2),
+                            width: 1,
+                          ),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      // Barra de progreso con gradiente animado
+                      FractionallySizedBox(
+                        widthFactor: (currentDrowsinessLevel * _statusAnimation.value).clamp(0.0, 1.0),
+                        child: Container(
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: currentDrowsinessLevel >= 0.75
+                                  ? [
+                                      Colors.red.shade400,
+                                      Colors.red.shade600,
+                                      Colors.red.shade800,
+                                    ]
+                                  : currentDrowsinessLevel >= 0.50
+                                      ? [
+                                          Colors.orange.shade400,
+                                          Colors.orange.shade600,
+                                          Colors.orange.shade800,
+                                        ]
+                                      : [
+                                          Colors.green.shade400,
+                                          Colors.green.shade600,
+                                          Colors.green.shade800,
+                                        ],
+                              begin: Alignment.centerLeft,
+                              end: Alignment.centerRight,
+                            ),
+                            boxShadow: [
+                              BoxShadow(
+                                color: (currentDrowsinessLevel >= 0.75
+                                        ? Colors.red
+                                        : currentDrowsinessLevel >= 0.50
+                                            ? Colors.orange
+                                            : Colors.green)
+                                    .withOpacity(0.6),
+                                blurRadius: 12,
+                                spreadRadius: 2,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      // Efecto de brillo animado
+                      AnimatedPositioned(
+                        duration: const Duration(milliseconds: 800),
+                        left: (currentDrowsinessLevel * _statusAnimation.value * 300) - 50,
+                        child: Container(
+                          width: 80,
+                          height: 24,
+                          decoration: BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: [
+                                Colors.white.withOpacity(0),
+                                Colors.white.withOpacity(0.3),
+                                Colors.white.withOpacity(0),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+              const SizedBox(height: 10),
+              // Etiquetas de estado
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.check_circle,
+                        color: Colors.greenAccent,
+                        size: 16,
+                      ),
+                      const SizedBox(width: 6),
+                      const Text(
+                        "Seguro",
+                        style: TextStyle(
+                          color: Colors.greenAccent,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                  Row(
+                    children: [
+                      Icon(
+                        currentDrowsinessLevel >= 0.75
+                            ? Icons.warning_rounded
+                            : Icons.info_outline,
                         color: currentDrowsinessLevel >= 0.75
                             ? Colors.redAccent
                             : Colors.white70,
-                        fontWeight: currentDrowsinessLevel >= 0.75
-                            ? FontWeight.bold
-                            : FontWeight.normal,
+                        size: 16,
                       ),
-                    ),
+                      const SizedBox(width: 6),
+                      AnimatedOpacity(
+                        opacity: currentDrowsinessLevel >= 0.80 ? 1.0 : 0.7,
+                        duration: const Duration(milliseconds: 300),
+                        child: Text(
+                          currentDrowsinessLevel >= 0.75
+                              ? "¡ALERTA CRÍTICA!"
+                              : currentDrowsinessLevel >= 0.50
+                                  ? "Cuidado"
+                                  : "Normal",
+                          style: TextStyle(
+                            color: currentDrowsinessLevel >= 0.75
+                                ? Colors.redAccent
+                                : currentDrowsinessLevel >= 0.50
+                                    ? Colors.orangeAccent
+                                    : Colors.white70,
+                            fontWeight: currentDrowsinessLevel >= 0.75
+                                ? FontWeight.bold
+                                : FontWeight.normal,
+                            fontSize: 14,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -3793,6 +4992,194 @@ class _DrivingScreenState extends State<DrivingScreen>
           ),
         );
       },
+    );
+  }
+
+  // ========== WIDGETS UX MEJORADOS ==========
+  
+  /// Dashboard en tiempo real con métricas del viaje
+  Widget _buildRealTimeDashboard() {
+    // Calcular duración del viaje
+    final duration = _tripStartTime != null 
+        ? DateTime.now().difference(_tripStartTime!)
+        : Duration.zero;
+    
+    final hours = duration.inHours;
+    final minutes = duration.inMinutes.remainder(60);
+    final seconds = duration.inSeconds.remainder(60);
+    final durationText = hours > 0 
+        ? '${hours}h ${minutes}m'
+        : '$minutes:${seconds.toString().padLeft(2, '0')}';
+    
+    return Container(
+      margin: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [Colors.blue.shade900, Colors.purple.shade900],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.3),
+            blurRadius: 15,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Column(
+        children: [
+          const Text(
+            'Viaje Actual',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 24,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 20),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceAround,
+            children: [
+              _buildStatCard('Duración', durationText, Icons.timer),
+              _buildStatCard('Alertas', '$_currentTripAlerts', Icons.warning),
+              _buildStatCard('Críticas', '$_currentTripCritical', Icons.dangerous),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatCard(String label, String value, IconData icon) {
+    return Column(
+      children: [
+        Icon(icon, color: Colors.white70, size: 30),
+        const SizedBox(height: 8),
+        Text(
+          value,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 28,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        Text(
+          label,
+          style: const TextStyle(
+            color: Colors.white60,
+            fontSize: 14,
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Gráfico de somnolencia en tiempo real
+  Widget _buildDrowsinessChart() {
+    if (_drowsinessChartData.isEmpty) {
+      return Container(
+        height: 200,
+        margin: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.black.withOpacity(0.3),
+          borderRadius: BorderRadius.circular(15),
+        ),
+        child: const Center(
+          child: Text(
+            'Esperando datos...',
+            style: TextStyle(color: Colors.white54),
+          ),
+        ),
+      );
+    }
+    
+    // Normalizar timestamps a rango 0-60
+    final minTime = _drowsinessChartData.first.x;
+    final normalizedData = _drowsinessChartData.map((spot) {
+      final normalizedX = (spot.x - minTime) / 1000; // Convertir ms a segundos
+      return FlSpot(normalizedX, spot.y);
+    }).toList();
+    
+    return Container(
+      height: 200,
+      margin: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.3),
+        borderRadius: BorderRadius.circular(15),
+      ),
+      child: LineChart(
+        LineChartData(
+          gridData: const FlGridData(show: true, drawVerticalLine: false),
+          titlesData: const FlTitlesData(show: false),
+          borderData: FlBorderData(show: false),
+          minY: 0,
+          maxY: 1,
+          lineBarsData: [
+            LineChartBarData(
+              spots: normalizedData,
+              isCurved: true,
+              color: Colors.orange,
+              barWidth: 3,
+              dotData: const FlDotData(show: false),
+              belowBarData: BarAreaData(
+                show: true,
+                color: Colors.orange.withOpacity(0.2),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Indicador visual de estado del conductor
+  Widget _buildDriverStatusIndicator() {
+    Color statusColor;
+    String statusText;
+    IconData statusIcon;
+    
+    if (currentDrowsinessLevel < 0.3) {
+      statusColor = Colors.green;
+      statusText = 'ALERTA';
+      statusIcon = Icons.sentiment_very_satisfied;
+    } else if (currentDrowsinessLevel < 0.6) {
+      statusColor = Colors.orange;
+      statusText = 'CANSADO';
+      statusIcon = Icons.sentiment_neutral;
+    } else {
+      statusColor = Colors.red;
+      statusText = 'PELIGRO';
+      statusIcon = Icons.sentiment_very_dissatisfied;
+    }
+    
+    return Container(
+      margin: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: statusColor.withOpacity(0.2),
+        border: Border.all(color: statusColor, width: 3),
+        borderRadius: BorderRadius.circular(15),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(statusIcon, color: statusColor, size: 40),
+          const SizedBox(width: 15),
+          Text(
+            statusText,
+            style: TextStyle(
+              color: statusColor,
+              fontSize: 32,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

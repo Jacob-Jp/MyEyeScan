@@ -26,7 +26,7 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     
     <application
-        android:label="my_eyescas"
+        android:label="EyesCanDrive"
         android:name=".MainApplication"
         android:icon="@mipmap/ic_launcher"
         android:enableOnBackInvokedCallback="true">

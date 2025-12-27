@@ -33,7 +33,7 @@ class DriverAssistantApp extends StatelessWidget {
 
     return MaterialApp(
       navigatorKey: navigatorKey,
-      title: 'EyesCas - Asistente de Conducción',
+      title: 'EyeScanDrive - Asistente de Conducción IA',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         primarySwatch: Colors.blue,

@@ -4,6 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'driving_screen.dart';
 import 'camera_test_screen.dart';
+import 'trip_history_screen.dart';
+import 'emergency_contact_screen.dart';
+import 'user_profile_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -13,63 +16,6 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  final TextEditingController _userNameController = TextEditingController();
-  String _userName = '';
-
-  @override
-  void initState() {
-    super.initState();
-    _loadUserName();
-  }
-
-  @override
-  void dispose() {
-    _userNameController.dispose();
-    super.dispose();
-  }
-
-  // Cargar nombre del usuario desde SharedPreferences
-  Future<void> _loadUserName() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final name = prefs.getString('user_name') ?? '';
-
-      setState(() {
-        _userName = name;
-        _userNameController.text = name;
-      });
-    } catch (e) {
-      print('Error cargando nombre del usuario: $e');
-    }
-  }
-
-  // Guardar nombre del usuario en SharedPreferences
-  Future<void> _saveUserName() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('user_name', _userNameController.text.trim());
-
-      setState(() {
-        _userName = _userNameController.text.trim();
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('✅ Nombre guardado correctamente'),
-          backgroundColor: Colors.green,
-        ),
-      );
-    } catch (e) {
-      print('Error guardando nombre del usuario: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('❌ Error guardando el nombre'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -96,7 +42,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Información del usuario
+            // Opciones del Sistema
             Container(
               width: double.infinity,
               padding: const EdgeInsets.all(20),
@@ -104,7 +50,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 color: Colors.white.withOpacity(0.05),
                 borderRadius: BorderRadius.circular(20),
                 border: Border.all(
-                  color: Colors.blue.withOpacity(0.3),
+                  color: Colors.green.withOpacity(0.3),
                   width: 1,
                 ),
               ),
@@ -116,18 +62,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       Container(
                         padding: const EdgeInsets.all(12),
                         decoration: BoxDecoration(
-                          color: Colors.blue.withOpacity(0.2),
+                          color: Colors.green.withOpacity(0.2),
                           borderRadius: BorderRadius.circular(12),
                         ),
                         child: const Icon(
-                          Icons.person_rounded,
-                          color: Colors.blue,
+                          Icons.menu_rounded,
+                          color: Colors.green,
                           size: 24,
                         ),
                       ),
                       const SizedBox(width: 15),
                       const Text(
-                        'Información del Usuario',
+                        'Opciones del Sistema',
                         style: TextStyle(
                           color: Colors.white,
                           fontSize: 20,
@@ -139,185 +85,62 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
                   const SizedBox(height: 20),
 
-                  // Campo para el nombre
-                  const Text(
-                    'Nombre completo',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 16,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-
-                  const SizedBox(height: 10),
-
-                  TextField(
-                    controller: _userNameController,
-                    style: const TextStyle(color: Colors.white, fontSize: 16),
-                    decoration: InputDecoration(
-                      hintText: 'Ingresa tu nombre completo',
-                      hintStyle: TextStyle(color: Colors.grey.shade400),
-                      prefixIcon: const Icon(
-                        Icons.person_outline,
-                        color: Colors.blue,
-                      ),
-                      filled: true,
-                      fillColor: Colors.white.withOpacity(0.05),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.grey.shade600),
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.grey.shade600),
-                      ),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: const BorderSide(
-                          color: Colors.blue,
-                          width: 2,
-                        ),
-                      ),
-                    ),
-                  ),
-
-                  const SizedBox(height: 20),
-
-                  // Botón guardar
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton.icon(
-                      onPressed: _saveUserName,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.blue,
-                        foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(vertical: 16),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        elevation: 3,
-                      ),
-                      icon: const Icon(Icons.save_rounded),
-                      label: const Text(
-                        'Guardar Información',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-
-            const SizedBox(height: 30),
-
-            // Información adicional
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(20),
-              decoration: BoxDecoration(
-                color: Colors.white.withOpacity(0.05),
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: Colors.orange.withOpacity(0.3),
-                  width: 1,
-                ),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: Colors.orange.withOpacity(0.2),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: const Icon(
-                          Icons.info_outline_rounded,
-                          color: Colors.orange,
-                          size: 24,
-                        ),
-                      ),
-                      const SizedBox(width: 15),
-                      const Text(
-                        'Funciones Adicionales',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ],
-                  ),
-
-                  const SizedBox(height: 15),
-
-                  _buildInfoTile(
-                    icon: Icons.bluetooth_rounded,
-                    title: 'Conexión Bluetooth',
-                    subtitle:
-                        'Usa el modal de Bluetooth en la pantalla principal',
+                  // Botón Historial de Viajes
+                  _buildMenuButton(
+                    icon: Icons.history,
+                    title: 'Historial de Viajes',
+                    subtitle: 'Ver y descargar registros de viajes',
                     color: Colors.blue,
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => const TripHistoryScreen(),
+                        ),
+                      );
+                    },
                   ),
 
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 12),
 
-                  _buildInfoTile(
-                    icon: Icons.emergency_rounded,
-                    title: 'Contactos de Emergencia',
-                    subtitle:
-                        'Gestiona contactos desde el botón en pantalla principal',
+                  // Botón Contacto de Emergencia
+                  _buildMenuButton(
+                    icon: Icons.emergency,
+                    title: 'Contacto de Emergencia',
+                    subtitle: 'Configurar contactos de emergencia',
                     color: Colors.red,
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => const EmergencyContactScreen(),
+                        ),
+                      );
+                    },
                   ),
 
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 12),
 
-                  _buildInfoTile(
-                    icon: Icons.camera_alt,
-                    title: 'Detección IA',
-                    subtitle:
-                        'Sistema de detección de cansancio con cámara',
+                  // Botón Perfil de Usuario
+                  _buildMenuButton(
+                    icon: Icons.person_rounded,
+                    title: 'Perfil de Usuario',
+                    subtitle: 'Editar información personal',
                     color: Colors.purple,
+                    onTap: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => const UserProfileScreen(),
+                        ),
+                      );
+                    },
                   ),
                 ],
               ),
             ),
 
             const SizedBox(height: 30),
-
-            // Botón probar IA
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                onPressed: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) => const CameraTestScreen(),
-                    ),
-                  );
-                },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.purple,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 16),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                icon: const Icon(Icons.science_rounded),
-                label: const Text(
-                  '🧠 Probar Detección IA',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                ),
-              ),
-            ),
-
-            const SizedBox(height: 15),
 
             // Botón volver
             SizedBox(
@@ -345,44 +168,67 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  Widget _buildInfoTile({
+  Widget _buildMenuButton({
     required IconData icon,
     required String title,
     required String subtitle,
     required Color color,
+    required VoidCallback onTap,
   }) {
-    return Container(
-      padding: const EdgeInsets.all(15),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: color.withOpacity(0.3)),
-      ),
-      child: Row(
-        children: [
-          Icon(icon, color: color, size: 24),
-          const SizedBox(width: 15),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  subtitle,
-                  style: TextStyle(color: Colors.grey.shade400, fontSize: 14),
-                ),
-              ],
-            ),
+        child: Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: color.withOpacity(0.15),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: color.withOpacity(0.4), width: 1.5),
           ),
-        ],
+          child: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: color.withOpacity(0.3),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Icon(icon, color: color, size: 24),
+              ),
+              const SizedBox(width: 15),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      subtitle,
+                      style: TextStyle(
+                        color: Colors.grey.shade400,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(
+                Icons.arrow_forward_ios_rounded,
+                color: color,
+                size: 18,
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
